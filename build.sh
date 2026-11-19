@@ -403,6 +403,15 @@ patch_repo "$recovery_mod" \
     "$root_dir/patches/experimental/recovery-sideload-disable-stock-recovery.patch" \
     aera_core.cpp 'persist.vendor.recovery_update'
 
+# AOSPA-style vendor flash_recovery applies /vendor/recovery-from-boot.p to
+# the recovery partition. AOSPA's vendor is read-only erofs, so renaming
+# install-recovery.sh cannot work. Mask the service with a system init
+# override; system init is parsed before vendor init and the first service
+# definition wins.
+patch_repo "$recovery_mod" \
+    "$root_dir/patches/generic/recovery-vendor-flash-recovery-guard.patch" \
+    twrp-functions.cpp 'AERA vendor flash_recovery: masked service'
+
 # Recovery pins /vendor for the boot once its libraries are mapped; the zip
 # installer refuses to run until /vendor is unmounted. Release it before install.
 patch_repo "$recovery_mod" \

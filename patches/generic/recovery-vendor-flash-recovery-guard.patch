@@ -1,0 +1,228 @@
+--- a/twrp-functions.hpp
++++ b/twrp-functions.hpp
+@@ -151,6 +151,7 @@
+ 	static std::string Get_Balanced_Governor(void);	// Get the supported "balanced" CPU governor (schedutil, interactive, or ondemand)
+ 	static void Disable_Stock_Recovery_Replace(); // Disable stock ROMs from replacing OrangeFox with stock recovery
+ 	static void Disable_Stock_Recovery_Replace_Func(); // Disable stock ROMs from replacing OrangeFox with stock recovery (/system must be already mounted)	
++	static bool Disable_Vendor_Flash_Recovery_Service(); // Mask the ROM's vendor flash_recovery service with a system init override
+ 	static unsigned long long IOCTL_Get_Block_Size(const char* block_device);
+ 	static void copy_kernel_log(string curr_storage); // Copy Kernel Log to Current Storage (PSTORE/KMSG)
+ 	static void copy_logcat(string curr_storage); // Copy Logcat to Current Storage
+--- a/twrp-functions.cpp
++++ b/twrp-functions.cpp
+@@ -21,6 +21,7 @@
+ */
+ 
+ #include <stdio.h>
++#include <string.h>
+ #include "aera_mobile/client.hpp"
+ #include <stdlib.h>
+ #include <string>
+@@ -337,6 +338,11 @@
+ /* function to run just before every reboot */
+ void TWFunc::Run_Before_Reboot(void)
+ {
++    // A ROM install can leave a vendor flash_recovery service that would
++    // replace AERA on the next boot. Mask the service with a system init
++    // override; only fall back to the boot cmdline guard if that fails.
++    Disable_Vendor_Flash_Recovery_Service();
++
+     // AVB20
+     Patch_AVB20(true);
+     usleep(4096);
+@@ -2399,6 +2405,145 @@
+          Disable_Stock_Recovery_Replace_Func();           
+          PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
+      }
++  // The Android root mount can fail on a ROM whose system is not mapped yet.
++  // Mask the vendor flash_recovery service directly; the reboot hook also
++  // retries this and falls back to the boot cmdline guard if needed.
++  Disable_Vendor_Flash_Recovery_Service();
++}
++
++// Android init parses /system/etc/init before /vendor/etc/init. Defining the
++// vendor's flash_recovery service first makes the vendor definition a duplicate
++// that init ignores. A disabled dummy service therefore stops the recovery
++// overwrite without touching the boot image or the read-only erofs vendor.
++bool TWFunc::Disable_Vendor_Flash_Recovery_Service(void)
++{
++  LOGINFO("AERA vendor flash_recovery: check (dont=%d advanced=%d force=%d)\n",
++          DataManager::GetIntValue(AERA_DONT_REPLACE_STOCK),
++          DataManager::GetIntValue(AERA_ADVANCED_STOCK_REPLACE),
++          Aera_Force_Deactivate_Process);
++  if (DataManager::GetIntValue(AERA_DONT_REPLACE_STOCK) == 1)
++    return false;
++  // Vanilla builds leave AERA_ADVANCED_STOCK_REPLACE at 0; keep AERA unless
++  // the user explicitly requested stock recovery.
++
++  // Do not probe /vendor here: AOSPA's vendor is erofs and the recovery's
++  // /vendor fstab entry may not mount it. The dummy is harmless when the ROM
++  // has no vendor_flash_recovery service, and prevents the service when it
++  // does.
++  std::string block;
++  TWPartition *system = PartitionManager.Find_Partition_By_Path("/system");
++  if (system != NULL && !system->Actual_Block_Device.empty())
++    block = system->Actual_Block_Device;
++  if (block.empty())
++    {
++      const char *candidates[] = {
++          "/dev/block/mapper/system",
++          "/dev/block/by-name/system",
++          "/dev/block/bootdevice/by-name/system"};
++      for (const char *candidate : candidates)
++        if (Path_Exists(candidate))
++          {
++            block = candidate;
++            break;
++          }
++    }
++  if (block.empty())
++    {
++      LOGINFO("AERA vendor flash_recovery: system block device not found\n");
++      return false;
++    }
++
++  PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
++  PartitionManager.UnMount_By_Path("/system", false);
++
++  const char *mount_point = "/mnt/aera-system-rw";
++  mkdir(mount_point, 0755);
++  if (mount(block.c_str(), mount_point, "ext4", 0, "") != 0)
++    {
++      LOGINFO("AERA vendor flash_recovery: cannot mount %s rw: %s\n",
++              block.c_str(), strerror(errno));
++      return false;
++    }
++
++  std::string root = mount_point;
++  if (Path_Exists(root + "/system/etc/init"))
++    root += "/system";
++  const std::string init_dir = root + "/etc/init";
++  static const char override_text[] =
++      "\nservice vendor_flash_recovery /system/bin/true\n"
++      "    class core\n"
++      "    user root\n"
++      "    oneshot\n"
++      "    disabled\n";
++
++  bool masked = false;
++  DIR *dir = opendir(init_dir.c_str());
++  if (dir != NULL)
++    {
++      std::vector<std::string> files;
++      struct dirent *entry;
++      while ((entry = readdir(dir)) != NULL)
++        {
++          std::string name(entry->d_name);
++          if (name.size() > 3 && name.compare(name.size() - 3, 3, ".rc") == 0)
++            files.push_back(init_dir + "/" + name);
++        }
++      closedir(dir);
++      std::sort(files.begin(), files.end());
++
++      for (const auto &file : files)
++        {
++          std::string data;
++          if (read_file(file, data) != 0)
++            continue;
++          if (data.find("service vendor_flash_recovery") != std::string::npos)
++            {
++              masked = true;
++              break;
++            }
++          struct stat st;
++          if (stat(file.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
++            continue;
++          const long long slack = (long long)st.st_blocks * 512 - (long long)st.st_size;
++          if (slack < (long long)sizeof(override_text))
++            continue;
++          int fd = open(file.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
++          if (fd < 0)
++            continue;
++          const ssize_t written = write(fd, override_text, sizeof(override_text) - 1);
++          fsync(fd);
++          close(fd);
++          if (written == (ssize_t)(sizeof(override_text) - 1))
++            {
++              LOGINFO("AERA vendor flash_recovery: masked service in %s\n", file.c_str());
++              masked = true;
++              break;
++            }
++        }
++    }
++
++  if (!masked)
++    {
++      const std::string file = init_dir + "/zz_aera_disable_vendor_flash_recovery.rc";
++      int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++      if (fd >= 0)
++        {
++          const ssize_t written = write(fd, override_text + 1, sizeof(override_text) - 2);
++          fsync(fd);
++          close(fd);
++          if (written == (ssize_t)(sizeof(override_text) - 2))
++            {
++              LOGINFO("AERA vendor flash_recovery: created %s\n", file.c_str());
++              masked = true;
++            }
++        }
++    }
++
++  sync();
++  umount(mount_point);
++  if (!masked)
++    LOGINFO("AERA vendor flash_recovery: no system init slot was available\n");
++  return masked;
+ }
+ 
+ unsigned long long TWFunc::IOCTL_Get_Block_Size(const char *block_device)
+--- a/aera_core.cpp
++++ b/aera_core.cpp
+@@ -1108,6 +1108,10 @@
+ 	#endif
+ 	//---- Virtual A/B compensations ---- //
+          PartitionManager.Update_System_Details();
++	// Re-check the freshly installed ROM's vendor. If it still carries a
++	// flash_recovery service (AOSPA does, on read-only erofs), guard the boot
++	// image before the user can reboot into the ROM.
++	TWFunc::Disable_Stock_Recovery_Replace();
+ 	// Run any custom script after completion of all ROM flashing processes
+ 	TWFunc::RunFoxScript("/system/bin/post_rom_flash_completion.sh", "");
+ 
+--- a/aeraui/platform/aera_ui_host.cpp
++++ b/aeraui/platform/aera_ui_host.cpp
+@@ -106,7 +106,13 @@
+       android::base::GetProperty(TW_FASTBOOT_MODE_PROP, "0") == "1";
+   const bool resume = !fastboot &&
+       android::base::GetProperty(AERA_SOFT_SWITCH_PROP, "0") == "1";
+-  if (!fastboot) aeraui::RecoveryWifiInitialize();
++  if (!fastboot) {
++    // The UI starts after decryption and is always linked. Apply the system
++    // init override here so a previously installed ROM cannot replace AERA
++    // even if the install/reboot hooks were skipped.
++    TWFunc::Disable_Vendor_Flash_Recovery_Service();
++    aeraui::RecoveryWifiInitialize();
++  }
+   if (resume) android::base::SetProperty(AERA_SOFT_SWITCH_PROP, "0");
+ 
+   const aeraui::RunResult result = fastboot
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -96,6 +96,8 @@
+   if (result == 0 && wipe_cache)
+     result = PartitionManager.Wipe_By_Path("/cache") ? 0 : 1;
+   PartitionManager.Update_System_Details();
++  if (result == 0)
++    TWFunc::Disable_Vendor_Flash_Recovery_Service();
+   TWFunc::SetPerformanceMode(false);
+   return result;
+ }
+@@ -1283,6 +1285,8 @@
+   TWFunc::Fox_Property_Set("ctl.start", "adbd");
+   TWFunc::Toggle_MTP(mtp_was_enabled);
+   PartitionManager.Update_System_Details();
++  if (result == 0)
++    TWFunc::Disable_Vendor_Flash_Recovery_Service();
+   TWFunc::SetPerformanceMode(false);
+   RecoveryFinishSideload();
+   RestartWlanAfterInstall(wlan_was_up);
