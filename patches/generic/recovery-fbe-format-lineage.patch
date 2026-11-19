@@ -1,0 +1,90 @@
+--- a/partition.cpp
++++ b/partition.cpp
+@@ -2292,6 +2292,8 @@
+ bool TWPartition::Wipe_Encryption() {
+ 	bool Save_Data_Media = Has_Data_Media;
+ 	bool ret = false;
++	bool raw_metadata_wipe = false;
++	bool wiped = false;
+ 	std::string the_wipe_fs;
+ 
+ 	if (TWFunc::Block_Operations_Until_Reboot())
+@@ -2311,6 +2313,13 @@
+ 
+ 	Find_Actual_Block_Device();
+ 	if (!Is_Present) {
++		// Format_Data may have already detached the decrypted mapping before
++		// calling us. Fall back to the raw primary device instead of bailing.
++		Decrypted_Block_Device = "";
++		Is_Decrypted = false;
++		Find_Actual_Block_Device();
++	}
++	if (!Is_Present) {
+ 		LOGINFO("Block device not present, cannot format %s.\n", Display_Name.c_str());
+ 		gui_msg(Msg(msg::kError, "unable_to_wipe=Unable to wipe {1}.")(Display_Name));
+ 		return false;
+@@ -2329,6 +2338,14 @@
+ 	Decrypted_Block_Device = "";
+ 	Is_Decrypted = false;
+ 	Is_Encrypted = false;
++	// The decrypted dm node is not the userdata partition. Drop the mapping
++	// state and resolve the raw block device again before discarding it.
++	Find_Actual_Block_Device();
++	if (!Is_Present) {
++		LOGINFO("Block device not present after unmount, cannot format %s.\n", Display_Name.c_str());
++		gui_msg(Msg(msg::kError, "unable_to_wipe=Unable to wipe {1}.")(Display_Name));
++		goto exit;
++	}
+ 
+ #ifdef OF_DISPLAY_FORMAT_FILESYSTEMS_DEBUG_INFO
+ 	gui_print("DEBUG: Fstab_File_System=%s\n", Fstab_File_System.c_str());
+@@ -2336,7 +2353,17 @@
+ 	gui_print("DEBUG: Format_Target_File_System=%s\n", the_wipe_fs.c_str());
+ #endif
+ 
+-	if (Wipe(the_wipe_fs)) {
++	// Match Lineage recovery: metadata-encrypted data must be wiped raw and
++	// formatted by vold on the first Android boot. Pre-creating the FBE layout
++	// (or mkfs'ing /data here) leaves Android unable to prepare user 0.
++	raw_metadata_wipe = !Key_Directory.empty();
++	if (raw_metadata_wipe) {
++		LOGINFO("AERA: raw-wiping metadata-encrypted data; Android/vold will format it on first boot\n");
++		wiped = TWFunc::Exec_Cmd("/system/bin/blkdiscard -f " + Actual_Block_Device) == 0;
++	} else {
++		wiped = Wipe(the_wipe_fs);
++	}
++	if (wiped) {
+ 		Has_Data_Media = Save_Data_Media;
+ 		DataManager::SetValue(TW_IS_ENCRYPTED, 0);
+ #ifndef TW_OEM_BUILD
+@@ -2353,7 +2380,7 @@
+ 			}
+ 		}
+ 		ret = true;
+-		if (!Key_Directory.empty())
++		if (!raw_metadata_wipe && !Key_Directory.empty())
+ 			ret = PartitionManager.Wipe_By_Path(Key_Directory);
+ 		if (ret) {
+ 			ret = base_partition->PostWipeEncryption();
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -2468,11 +2468,14 @@
+ 	}
+ 
+ 	if (ret) {
+-		#ifdef OF_WIPE_METADATA_AFTER_DATAFORMAT
+-		usleep(2048);
+-		Wipe_By_Path("/metadata");
+-		usleep(2048);
+-		#endif
++		// Lineage WipeData also clears cache and metadata.
++		if (Find_Partition_By_Path("/cache") != NULL)
++			Wipe_By_Path("/cache");
++		if (Find_Partition_By_Path("/metadata") != NULL) {
++			usleep(2048);
++			Wipe_By_Path("/metadata");
++			usleep(2048);
++		}
+ 		TWFunc::check_and_run_script(TW_FORMAT_DATA_SCRIPT, "Format Data Script");
+ 	}
+ 	return ret;
