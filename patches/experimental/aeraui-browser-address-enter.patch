@@ -1,0 +1,14 @@
+--- a/aeraui/features/browser/web_scene.cpp	2026-11-16 18:21:48.199090580 +0200
++++ b/aeraui/features/browser/web_scene.cpp	2026-11-16 18:21:48.218743030 +0200
+@@ -942,6 +942,11 @@
+     auto *s = static_cast<WebScene *>(lv_event_get_user_data(e));
+     ShowKeyboard(s, false);
+   }, LV_EVENT_CLICKED, s);
++  // Enter in the address field loads it; the keyboard's ready key does too.
++  lv_obj_add_event_cb(s->address, [](lv_event_t *e) {
++    auto *s = static_cast<WebScene *>(lv_event_get_user_data(e));
++    OpenAddressBar(s);
++  }, LV_EVENT_READY, s);
+   lv_obj_add_event_cb(s->keyboard, [](lv_event_t *e) {
+     auto *s = static_cast<WebScene *>(lv_event_get_user_data(e));
+     if (lv_event_get_code(e) == LV_EVENT_READY && !s->web_keyboard)

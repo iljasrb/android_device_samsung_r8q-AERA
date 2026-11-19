@@ -1,0 +1,15 @@
+--- a/aeraui/core/gpu_renderer.cpp
++++ b/aeraui/core/gpu_renderer.cpp
+@@ -97,7 +97,12 @@ bool GpuRenderer::Initialize(int32_t width, int32_t height) {
+   if (dlopen(kLibcxxCompat, RTLD_NOW | RTLD_GLOBAL) == nullptr)
+     __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                         "libc++ compatibility shim unavailable: %s", dlerror());
+ 
++  // The shim is now loaded into this process. Drop the inherited LD_PRELOAD
++  // so installer/plugin child processes do not try to load it while the ROM's
++  // /system is mounted, where the recovery shim does not exist.
++  unsetenv("LD_PRELOAD");
++
+   // Load the ramdisk's platform graphics libraries before EGL. The vendor
+   // subdriver links libgralloctypes/libnativewindow/libui; if /vendor is
+   // mounted first, the linker picks the ROM's newer copies and the Adreno

@@ -1,0 +1,41 @@
+--- a/aeraui/features/browser/jail_main.cpp	2026-11-16 18:06:51.835397371 +0200
++++ b/aeraui/features/browser/jail_main.cpp	2026-11-16 18:06:51.836143924 +0200
+@@ -241,16 +241,26 @@
+   int kill_file = open((tasks + "/cgroup.kill").c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+   int killer = kill_file < 0 ? -1 : fcntl(kill_file, F_DUPFD_CLOEXEC, 5);
+   if (kill_file >= 0) close(kill_file);
++  // The memory controller may live in cgroup v2, or not be enabled at all, on
++  // recovery kernels. The task group still bounds the process tree; run
++  // without a hard memory bound rather than refusing to start the browser.
++  const bool have_memory =
++      access((memory + "/memory.limit_in_bytes").c_str(), W_OK) == 0;
++  if (!have_memory) {
++    rmdir(memory.c_str());
++    fprintf(stderr, "browser: memory cgroup unavailable; no hard memory limit\n");
++  }
+   // cgroup.kill was added after Linux 5.10. Some otherwise fully capable
+   // recovery kernels (including Garnet's) therefore expose the Android task
+   // and memory controllers without that file. Keep the hard memory bound and
+   // fall back to the jail's dedicated process group for tree termination.
+-  if (!WriteFile(memory + "/memory.limit_in_bytes", memory_limit)) {
++  if (have_memory && !WriteFile(memory + "/memory.limit_in_bytes", memory_limit)) {
+     if (killer >= 0) close(killer);
+     rmdir(memory.c_str()); rmdir(tasks.c_str()); Die("browser resource limits");
+   }
+   struct stat swap{};
+-  if (!stat((memory + "/memory.memsw.limit_in_bytes").c_str(), &swap) &&
++  if (have_memory &&
++      !stat((memory + "/memory.memsw.limit_in_bytes").c_str(), &swap) &&
+       !WriteFile(memory + "/memory.memsw.limit_in_bytes", memory_limit)) {
+     close(killer); rmdir(memory.c_str()); rmdir(tasks.c_str()); Die("browser swap limit");
+   }
+@@ -267,7 +277,8 @@
+   if (!child) {
+     for (int signal : {SIGTERM, SIGINT, SIGHUP}) ::signal(signal, SIG_DFL);
+     Check(setsid(), "private browser process group");
+-    if (!WriteFile(tasks + "/cgroup.procs", "0") || !WriteFile(memory + "/cgroup.procs", "0"))
++    if (!WriteFile(tasks + "/cgroup.procs", "0") ||
++        (have_memory && !WriteFile(memory + "/cgroup.procs", "0")))
+       Die("join browser resource groups");
+     if (killer >= 0) close(killer);
+     return;

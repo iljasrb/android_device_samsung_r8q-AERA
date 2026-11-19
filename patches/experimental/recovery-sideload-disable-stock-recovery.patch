@@ -1,0 +1,14 @@
+--- a/aera_core.cpp
++++ b/aera_core.cpp
+@@ -1116,6 +1116,11 @@
+ 	gui_print_color("warning", "\n\nYou must now reboot AERA immediately!\n\nDo NOT attempt anything else before rebooting AERA.\n");
+ #endif
+      }
++
++   // Samsung/Lineage vendor init only restores /vendor/etc/recovery.img when
++   // this persistent property is true. Clear it after any successful install
++   // so a new ROM cannot replace AERA on its first boot.
++   TWFunc::Exec_Cmd(Aera_ResetProp_Bin + " -p --delete persist.vendor.recovery_update");
+ }
+ 
+ bool Fox_Skip_Treble_Compatibility_Check()

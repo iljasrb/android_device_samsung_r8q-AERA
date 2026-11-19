@@ -1,0 +1,17 @@
+--- a/etc/init.rc
++++ b/etc/init.rc
+@@ -247,6 +247,14 @@
+     stop fastbootd
+     setprop sys.usb.ffs.ready 0
+     rm /config/usb_gadget/g1/configs/b.1/f1
++    rm /config/usb_gadget/g1/configs/b.1/f2
++    rm /config/usb_gadget/g1/configs/b.1/f3
++    rm /config/usb_gadget/g1/configs/b.1/f4
++    rm /config/usb_gadget/g1/configs/b.1/f5
++    rm /config/usb_gadget/g1/configs/b.1/f6
++    rm /config/usb_gadget/g1/configs/b.1/f7
++    rm /config/usb_gadget/g1/configs/b.1/f8
++    rm /config/usb_gadget/g1/configs/b.1/f9
+     setprop sys.usb.state ${sys.usb.config}
+ 
+ on property:sys.usb.config=sideload && property:sys.usb.ffs.ready=1 && property:sys.usb.configfs=1

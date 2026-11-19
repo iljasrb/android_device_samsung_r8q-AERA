@@ -1,0 +1,633 @@
+diff --git a/aeraui/features/audio/pcm_bridge.c b/aeraui/features/audio/pcm_bridge.c
+new file mode 100644
+index 0000000..ddbd1d3
+--- /dev/null
++++ b/aeraui/features/audio/pcm_bridge.c
+@@ -0,0 +1,627 @@
++/*
++ * Copyright (C) 2026 AERA Recovery Project contributors
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PCM bridge for the isolated AERA browser.
++ *
++ * The browser is jailed and cannot open ALSA devices or talk to Android audio
++ * services. Its GStreamer sink (libgstaeraaudio.so) therefore forwards a fixed
++ * 48 kHz / stereo / S16LE PCM stream to this root-owned bridge over an abstract
++ * AF_UNIX socket, and the bridge drives the device's ASoC playback PCM.
++ *
++ * Design
++ * ------
++ * The ASM/DSP playback path on this platform is unforgiving: it underruns
++ * easily, an underrun that is not silenced repeats stale DSP buffers (audible
++ * as distortion), and tearing the session down and rebuilding it is slow and
++ * failure prone. The bridge is therefore built around four rules:
++ *
++ *  1. A correctly configured DMA ring. The stream is prefilled before it
++ *     starts, and underruns are filled with hardware silence instead of
++ *     replaying the last buffers. This is the difference between clean audio
++ *     and permanent distortion after the first hiccup.
++ *  2. Whole periods only. Data is written in exact period-sized blocks so the
++ *     ring layout never depends on how the byte-stream socket was chunked.
++ *  3. One persistent PCM session. The browser rebuilds its media pipeline on
++ *     pause/seek/quality changes; the DSP stream survives that so the new
++ *     pipeline starts into a warm ring instead of a cold, freshly opened one.
++ *  4. Latest client wins. A rebuilt pipeline connects a new socket while the
++ *     old one may still be open. The bridge preempts the stale client so the
++ *     new pipeline is never starved behind a dead connection.
++ */
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/prctl.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <tinyalsa/asoundlib.h>
++
++static const uid_t kBrowserUid = 99090;
++static const uid_t kMediaUid = 99092;
++static const uid_t kDoomUid = 99094;
++static const uint32_t kMagic = 0x41525041U;
++static const uint32_t kRate = 48000U;
++static const uint32_t kChannels = 2U;
++static const uint32_t kBits = 16U;
++static const char kSocketName[] = "aera-browser-audio-v1";
++/* Out-of-band control socket: a flush must not disturb the data connection,
++ * otherwise every pause/seek makes the DSP tear the ring down. */
++static const char kControlName[] = "aera-browser-audio-ctl-v1";
++/* "ARFL" -- flush the buffered audio and drop the DMA ring. */
++static const uint32_t kFlushMagic = 0x4152464CU;
++
++static volatile sig_atomic_t g_stop = 0;
++
++/* DMA geometry: 1024 frames (~21.3 ms) per period, four periods (~85 ms).
++ * Stereo S16LE is 4 bytes per frame, so a period is 4096 bytes and always a
++ * whole number of frames -- a write can never shift the sample grid. */
++static const unsigned int kPeriodFrames = 1024;
++static const unsigned int kPeriodCount = 4;
++static const size_t kPeriodBytes = 1024 * 4;
++/* Prefill target before the DMA starts: three periods, so playback begins with
++ * ~64 ms of audio queued instead of one frame. */
++static const unsigned int kStartThreshold = 1024 * 3;
++/* Release the PCM (and the speaker amp) once no client and no audio remain. */
++static const int kIdleCloseMs = 6000;
++/* How long the producer may stall before the bridge emits a silence period. */
++static const int kStarveMs = 100;
++/* The sink sends its 16-byte hello immediately after connect(); a connection
++ * that has not done so by now is stale and must not stall the bridge. */
++static const int kHandshakeMs = 250;
++static const int kControlHandshakeMs = 200;
++/* A single pcm_write() must not block for the 30 s ASM command timeout. */
++static const int kWriteTimeoutMs = 500;
++static const int kOpenRetries = 4;
++static const int kOpenRetryDelayMs = 100;
++/* Scratch space for socket bytes awaiting a whole period. */
++static const size_t kBufferBytes = 64 * 1024;
++/* Bounded mirror of the PCM handed to the DSP, for on-device analysis. */
++static const size_t kDumpBytes = 4 * 1024 * 1024;
++
++static void Stop(int signal_number) {
++  (void)signal_number;
++  g_stop = 1;
++}
++
++/* SIGALRM only exists to interrupt a wedged pcm_write(); the interrupted ioctl
++ * is what the caller reacts to, so there is no work to do here. */
++static void WriteTimeout(int signal_number) {
++  (void)signal_number;
++}
++
++static void SleepMs(int milliseconds) {
++  struct timespec delay = {.tv_sec = milliseconds / 1000,
++                           .tv_nsec = (long)(milliseconds % 1000) * 1000000L};
++  while (nanosleep(&delay, &delay) != 0 && errno == EINTR && !g_stop) {
++  }
++}
++
++static int64_t NowMs(void) {
++  struct timespec now;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
++  return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++/* Read exactly `size` bytes, giving up after `timeout_ms`.
++ *
++ * The handshake used to be a plain blocking read(). A connection that opened
++ * but never sent anything -- WebKit probes, an aborted seek, a crashed sink --
++ * then blocked the whole bridge forever: no audio, the browser's sink timed
++ * out, the media pipeline errored, and the page reloaded the player (which is
++ * what "seeking makes it start over with an ad" looked like). */
++static int ReadAll(int fd, void* output, size_t size, int timeout_ms) {
++  uint8_t* cursor = output;
++  const int64_t deadline = NowMs() + timeout_ms;
++  while (size && !g_stop) {
++    const ssize_t count = read(fd, cursor, size);
++    if (count > 0) {
++      cursor += count;
++      size -= (size_t)count;
++      continue;
++    }
++    if (count < 0 && errno == EINTR) continue;
++    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++      const int remaining = (int)(deadline - NowMs());
++      if (remaining <= 0) return 0;
++      struct pollfd input = {.fd = fd, .events = POLLIN, .revents = 0};
++      if (poll(&input, 1, remaining) > 0) continue;
++      return 0;
++    }
++    return 0;
++  }
++  return size == 0;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Mixer setup                                                               */
++/* ------------------------------------------------------------------------- */
++
++/* The vendor audio HAL normally selects the FE->BE route and the speaker
++ * amplifier from mixer_paths.xml. Recovery has no audio HAL, so the bridge has
++ * to apply the same controls before the front end can prepare; otherwise
++ * dpcm_fe_dai_prepare fails with "no backend DAIs enabled". */
++static void SetControl(struct mixer* mixer, const char* name, const char* value) {
++  struct mixer_ctl* control = mixer_get_ctl_by_name(mixer, name);
++  if (control == NULL) {
++    fprintf(stderr, "AERA audio: missing mixer control: %s\n", name);
++    return;
++  }
++  if (mixer_ctl_get_type(control) == MIXER_CTL_TYPE_ENUM) {
++    if (mixer_ctl_set_enum_by_string(control, value) != 0)
++      fprintf(stderr, "AERA audio: cannot set %s=%s\n", name, value);
++    return;
++  }
++  const int number = atoi(value);
++  const unsigned int count = mixer_ctl_get_num_values(control);
++  for (unsigned int index = 0; index < count; ++index) {
++    if (mixer_ctl_set_value(control, index, number) != 0)
++      fprintf(stderr, "AERA audio: cannot set %s[%u]=%d\n", name, index,
++              number);
++  }
++}
++
++static void ConfigureRoute(struct mixer* mixer) {
++  if (mixer == NULL) return;
++  /* MultiMedia1 -> PRI_TDM_RX_0, the CS35L41 speaker/earpiece backend. */
++  SetControl(mixer, "PRI_TDM_RX_0 Audio Mixer MultiMedia1", "1");
++  SetControl(mixer, "PRI_TDM_RX_0 Channels", "Two");
++  /* The CS35L41 protection DSP firmware is loaded on preload. Without the
++   * vendor's cs35l40-*.wmfw files the DSP never boots and the amp stays silent
++   * even though it unmutes. */
++  SetControl(mixer, "Left DSP1 Firmware", "Protection");
++  SetControl(mixer, "Right DSP1 Firmware", "Protection");
++  SetControl(mixer, "Left DSP1 Preload Switch", "1");
++  SetControl(mixer, "Right DSP1 Preload Switch", "1");
++  /* Both amps take the DSP path fed from ASPRX1. */
++  SetControl(mixer, "Left PCM Source", "DSP");
++  SetControl(mixer, "Right PCM Source", "DSP");
++  SetControl(mixer, "Left DSP RX2 Source", "ASPRX1");
++  SetControl(mixer, "Right DSP RX2 Source", "ASPRX1");
++  SetControl(mixer, "Left AMP Enable Switch", "1");
++  SetControl(mixer, "Right AMP Enable Switch", "1");
++  SetControl(mixer, "Left AMP Mute", "Unmuted");
++  SetControl(mixer, "Right AMP Mute", "Unmuted");
++  /* Recovery uses the minimum amp gain: the vendor media path's 18 dB is far
++   * too loud for a system/UI sound on this speaker. */
++  SetControl(mixer, "Left AMP PCM Gain", "0");
++  SetControl(mixer, "Right AMP PCM Gain", "0");
++}
++
++/* ------------------------------------------------------------------------- */
++/* Volume                                                                    */
++/* ------------------------------------------------------------------------- */
++
++static int ReadVolume(void) {
++  const int fd = open("/tmp/aera-audio-volume", O_RDONLY | O_CLOEXEC);
++  if (fd < 0) return -1;
++  char buffer[8] = {0};
++  const ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
++  close(fd);
++  if (count <= 0) return -1;
++  int volume = atoi(buffer);
++  if (volume < 0) volume = 0;
++  if (volume > 100) volume = 100;
++  return volume;
++}
++
++static int CurrentVolume(void) {
++  const int volume = ReadVolume();
++  return volume < 0 ? 30 : volume;
++}
++
++/* The CS35L41 digital volume is extremely steep near zero (200 is already
++ * inaudible), so it stays at a fixed output stage and the UI volume is applied
++ * to the PCM samples. That gives one smooth, global volume control for every
++ * client of the bridge. */
++static void ScalePcm(uint8_t* data, size_t size, int volume) {
++  int16_t* samples = (int16_t*)data;
++  const size_t count = size / sizeof(int16_t);
++  for (size_t index = 0; index < count; ++index)
++    samples[index] = (int16_t)((int32_t)samples[index] * volume / 100);
++}
++
++/* ------------------------------------------------------------------------- */
++/* PCM session                                                               */
++/* ------------------------------------------------------------------------- */
++
++static struct pcm* OpenPcmOnce(void) {
++  const unsigned int buffer_frames = kPeriodFrames * kPeriodCount;
++  struct pcm_config config = {
++      .channels = kChannels,
++      .rate = kRate,
++      .period_size = kPeriodFrames,
++      .period_count = kPeriodCount,
++      .format = PCM_FORMAT_S16_LE,
++      /* Prefill before starting so the very first DMA period is not already
++       * racing an empty ring. */
++      .start_threshold = kStartThreshold,
++      /* Leave the xrun policy at the driver default. Setting
++       * silence_threshold/silence_size to a full buffer made the DSP stop the
++       * substream as soon as the buffer was all silence, which showed up as
++       * constant msm_pcm_trigger START/STOP churn. The bridge instead feeds
++       * one period per period time and never lets the ring drain. */
++      .stop_threshold = buffer_frames,
++      .silence_threshold = 0,
++      .silence_size = 0,
++      .avail_min = kPeriodFrames,
++  };
++  struct pcm* pcm = pcm_open(0, 0, PCM_OUT, &config);
++  if (pcm == NULL) return NULL;
++  if (!pcm_is_ready(pcm)) {
++    fprintf(stderr, "AERA audio: pcm not ready: %s\n", pcm_get_error(pcm));
++    pcm_close(pcm);
++    return NULL;
++  }
++  return pcm;
++}
++
++/* Opening right after a teardown can fail while the DSP still drains the
++ * previous session, so retry briefly instead of dropping the whole stream. */
++static struct pcm* OpenPcm(void) {
++  for (int attempt = 0; attempt < kOpenRetries && !g_stop; ++attempt) {
++    struct pcm* pcm = OpenPcmOnce();
++    if (pcm != NULL) return pcm;
++    if (attempt + 1 < kOpenRetries) SleepMs(kOpenRetryDelayMs);
++  }
++  return NULL;
++}
++
++/* Bind an abstract AF_UNIX listening socket. */
++static int ListenAbstract(const char* name, int backlog) {
++  const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++  if (fd < 0) return -1;
++  struct sockaddr_un address = {0};
++  address.sun_family = AF_UNIX;
++  const size_t length = strlen(name);
++  memcpy(address.sun_path + 1, name, length);
++  const socklen_t size = (socklen_t)(
++      offsetof(struct sockaddr_un, sun_path) + 1 + length);
++  if (bind(fd, (const struct sockaddr*)&address, size) != 0 ||
++      listen(fd, backlog) != 0) {
++    close(fd);
++    return -1;
++  }
++  return fd;
++}
++
++/* A seek only discards audio that has not reached the DSP yet. It must NOT
++ * issue SNDRV_PCM_IOCTL_DROP: on this platform DROP leaves the front end in a
++ * state where the next pcm_write() waits for the full ASM command timeout.
++ * That 500 ms wedge fills the socket, blocks the browser's sink, blocks
++ * WebKit's MSE source, and the rebuilt video pipeline then never receives
++ * another buffer ("seeking does not load video").
++ *
++ * The DMA ring only holds ~85 ms, so leaving it alone costs at most a few
++ * frames of pre-seek audio -- inaudible, and far cheaper than a wedge. */
++static void FlushPcm(struct pcm* pcm) {
++  (void)pcm;
++}
++
++static void ClosePcm(struct pcm** pcm) {
++  if (*pcm == NULL) return;
++  const unsigned int xruns = pcm_get_xruns(*pcm);
++  if (xruns != 0)
++    fprintf(stderr, "AERA audio: session ended with %u xrun(s)\n", xruns);
++  pcm_close(*pcm);
++  *pcm = NULL;
++}
++
++/* A bounded pcm_write(): a wedged DSP makes the ioctl block for the full 30 s
++ * ASM command timeout, which starves the browser. SIGALRM interrupts it. */
++static int WritePcm(struct pcm* pcm, const void* data, size_t size) {
++  struct itimerval timer = {0};
++  timer.it_value.tv_usec = (long)kWriteTimeoutMs * 1000L;
++  if (setitimer(ITIMER_REAL, &timer, NULL) != 0)
++    return pcm_write(pcm, data, (unsigned int)size);
++  const int result = pcm_write(pcm, data, (unsigned int)size);
++  struct itimerval cancel = {0};
++  (void)setitimer(ITIMER_REAL, &cancel, NULL);
++  return result;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Client handling                                                           */
++/* ------------------------------------------------------------------------- */
++
++static int AuthorizeClient(int client) {
++  struct ucred credentials = {0};
++  socklen_t credentials_size = sizeof(credentials);
++  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &credentials,
++                 &credentials_size) != 0 ||
++      credentials_size != sizeof(credentials) ||
++      (credentials.uid != kBrowserUid && credentials.uid != kMediaUid &&
++       credentials.uid != kDoomUid)) {
++    return 0;
++  }
++  uint32_t hello[4] = {0};
++  if (!ReadAll(client, hello, sizeof(hello), kHandshakeMs)) return 0;
++  return hello[0] == kMagic && hello[1] == kRate && hello[2] == kChannels &&
++         hello[3] == kBits;
++}
++
++/* Accept a flush request from an allowed jail UID. */
++static int IsFlushRequest(int client) {
++  struct ucred credentials = {0};
++  socklen_t credentials_size = sizeof(credentials);
++  if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &credentials,
++                 &credentials_size) != 0 ||
++      credentials_size != sizeof(credentials) ||
++      (credentials.uid != kBrowserUid && credentials.uid != kMediaUid &&
++       credentials.uid != kDoomUid)) {
++    return 0;
++  }
++  uint32_t magic = 0;
++  if (!ReadAll(client, &magic, sizeof(magic), kControlHandshakeMs)) return 0;
++  return magic == kFlushMagic;
++}
++
++int main(int argc, char** argv) {
++  if (argc != 2 || strcmp(argv[1], "--browser-audio") != 0 || getuid() != 0) {
++    fprintf(stderr,
++            "Usage (root recovery only): aera-audio-bridge --browser-audio\n");
++    return 64;
++  }
++
++  signal(SIGPIPE, SIG_IGN);
++  signal(SIGTERM, Stop);
++  signal(SIGINT, Stop);
++  signal(SIGALRM, WriteTimeout);
++  prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
++
++  const int server = ListenAbstract(kSocketName, 4);
++  if (server < 0) return 70;
++  const int control = ListenAbstract(kControlName, 4);
++  if (control < 0) {
++    close(server);
++    return 70;
++  }
++
++  struct mixer* mixer = NULL;
++  struct pcm* pcm = NULL;
++  /* Scratch: one socket buffer plus one DMA period. */
++  uint8_t* buffer = malloc(kBufferBytes);
++  uint8_t* period = malloc(kPeriodBytes);
++  if (buffer == NULL || period == NULL) {
++    free(buffer);
++    free(period);
++    close(server);
++    return 70;
++  }
++
++  /* Bring-up aid, opt-in: when /tmp/aera-audio-dump exists the exact PCM handed
++   * to the DSP is mirrored to /tmp/aera-audio-dump.raw (bounded) so a distorted
++   * stream can be measured instead of guessed at. Off by default: it costs a
++   * 4 MiB write per session and nobody needs it once audio is healthy. */
++  int dump_fd = -1;
++  if (access("/tmp/aera-audio-dump", F_OK) == 0)
++    dump_fd = open("/tmp/aera-audio-dump.raw",
++                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++  size_t dumped = 0;
++
++  size_t buffered = 0;
++  int client = -1;
++  int volume = CurrentVolume();
++  int volume_tick = 0;
++  int64_t last_audio_ms = NowMs();
++  unsigned int last_xruns = 0;
++  int64_t xrun_report_ms = NowMs();
++
++  while (!g_stop) {
++    if (++volume_tick >= 20) {
++      volume_tick = 0;
++      volume = CurrentVolume();
++    }
++
++    struct pollfd fds[3];
++    int count = 0;
++    const int server_index = count;
++    fds[count].fd = server;
++    fds[count].events = POLLIN;
++    fds[count].revents = 0;
++    ++count;
++    const int control_index = count;
++    fds[count].fd = control;
++    fds[count].events = POLLIN;
++    fds[count].revents = 0;
++    ++count;
++    int client_index = -1;
++    if (client >= 0) {
++      client_index = count;
++      fds[count].fd = client;
++      fds[count].events = POLLIN;
++      fds[count].revents = 0;
++      ++count;
++    }
++
++    /* The period write below blocks once the ring is full and paces the loop
++     * to real time, so poll must not add a delay when a period is ready. While
++     * accumulating, poll briefly instead of spinning. */
++    const int timeout_ms =
++        pcm == NULL ? 200 : (buffered >= kPeriodBytes ? 0 : 5);
++    const int ready = poll(fds, (nfds_t)count, timeout_ms);
++    if (ready < 0) {
++      if (errno == EINTR) continue;
++      break;
++    }
++
++    if (fds[server_index].revents & POLLIN) {
++      const int accepted = accept4(server, NULL, NULL, SOCK_CLOEXEC);
++      if (accepted >= 0) {
++        const int flags = fcntl(accepted, F_GETFL, 0);
++        if (flags >= 0) (void)fcntl(accepted, F_SETFL, flags | O_NONBLOCK);
++        if (!AuthorizeClient(accepted)) {
++          close(accepted);
++        } else {
++          /* Latest client wins: a rebuilt media pipeline must not be starved
++           * behind a stale connection. The PCM session itself is kept. */
++          if (client >= 0) {
++            fprintf(stderr, "AERA audio: new stream, preempting old client\n");
++            close(client);
++          }
++          client = accepted;
++          buffered = 0;
++          /* Drop pre-seek audio so the new stream starts clean. */
++          FlushPcm(pcm);
++          last_audio_ms = NowMs();
++          if (mixer == NULL) {
++            mixer = mixer_open(0);
++            if (mixer == NULL)
++              fprintf(stderr, "AERA audio: cannot open card 0 mixer\n");
++            else
++              ConfigureRoute(mixer);
++          }
++          if (pcm == NULL) {
++            pcm = OpenPcm();
++            if (pcm == NULL)
++              fprintf(stderr, "AERA audio: no playback card, draining\n");
++            else
++              fprintf(stderr, "AERA audio: playing on card 0 device 0\n");
++          }
++        }
++      }
++    }
++
++    if (fds[control_index].revents & POLLIN) {
++      const int request = accept4(control, NULL, NULL, SOCK_CLOEXEC);
++      if (request >= 0) {
++        const int flags = fcntl(request, F_GETFL, 0);
++        if (flags >= 0) (void)fcntl(request, F_SETFL, flags | O_NONBLOCK);
++        if (IsFlushRequest(request)) {
++          /* A seek or a rebuffered segment: drop pre-seek audio, keep the
++           * session and the data connection intact. */
++          buffered = 0;
++          FlushPcm(pcm);
++          last_audio_ms = NowMs();
++          fprintf(stderr, "AERA audio: flushed\n");
++        }
++        close(request);
++      }
++    }
++
++    if (client_index >= 0 && fds[client_index].revents != 0) {
++      const short events = fds[client_index].revents;
++      if (events & POLLIN) {
++        /* Drain the socket so the feeder always has the freshest audio. */
++        for (;;) {
++          if (buffered == kBufferBytes) break;
++          const ssize_t read_bytes =
++              read(client, buffer + buffered, kBufferBytes - buffered);
++          if (read_bytes > 0) {
++            buffered += (size_t)read_bytes;
++            continue;
++          }
++          if (read_bytes < 0 && (errno == EINTR || errno == EAGAIN))
++            break;
++          close(client);
++          client = -1;
++          buffered = 0;
++          FlushPcm(pcm);
++          break;
++        }
++      }
++      if (client >= 0 && (events & (POLLHUP | POLLERR))) {
++        close(client);
++        client = -1;
++        buffered = 0;
++        FlushPcm(pcm);
++      }
++    }
++
++    const int64_t now = NowMs();
++    const int64_t silent_ms = now - last_audio_ms;
++
++    if (pcm == NULL) {
++      /* Nothing is playing. Open lazily once there is audio, or as soon as a
++       * client is connected so the first period starts into a primed ring. */
++      if (client >= 0 || buffered >= kPeriodBytes) {
++        pcm = OpenPcm();
++        if (pcm != NULL) {
++          fprintf(stderr, "AERA audio: playing on card 0 device 0\n");
++          last_audio_ms = now;
++        }
++      }
++      continue;
++    }
++
++    /* Feed whole DMA periods only. A period must contain either 1024 real
++     * frames or 1024 frames of silence -- never a mix. Padding a short period
++     * with zeros splices 48 kHz of nothing into the middle of the waveform at
++     * an offset chosen by socket chunking, which is heard as random buzzing
++     * and is only cleared by a seek that resets the stream. So wait until a
++     * full period has arrived, and inject silence only if the producer has
++     * genuinely stalled. */
++    const int have_period = buffered >= kPeriodBytes;
++    const int starved = client < 0 || silent_ms >= kStarveMs;
++    if (!have_period && !starved) {
++      /* Accumulate: the DMA ring (~85 ms) absorbs the wait. */
++      continue;
++    }
++
++    if (have_period) {
++      memcpy(period, buffer, kPeriodBytes);
++      ScalePcm(period, kPeriodBytes, volume);
++      memmove(buffer, buffer + kPeriodBytes, buffered - kPeriodBytes);
++      buffered -= kPeriodBytes;
++    } else {
++      memset(period, 0, kPeriodBytes);
++    }
++
++    if (WritePcm(pcm, period, kPeriodBytes) < 0) {
++      fprintf(stderr, "AERA audio: write failed (%s), closing session\n",
++              pcm_get_error(pcm));
++      ClosePcm(&pcm);
++      buffered = 0;
++      continue;
++    }
++    if (have_period) last_audio_ms = NowMs();
++
++    if (dump_fd >= 0 && have_period && dumped < kDumpBytes) {
++      const size_t want =
++          kPeriodBytes < kDumpBytes - dumped ? kPeriodBytes : kDumpBytes - dumped;
++      if (write(dump_fd, period, want) == (ssize_t)want) dumped += want;
++      if (dumped >= kDumpBytes) {
++        close(dump_fd);
++        dump_fd = -1;
++        fprintf(stderr, "AERA audio: PCM dump complete (%zu bytes)\n", dumped);
++      }
++    }
++
++    if (now - xrun_report_ms >= 1000) {
++      xrun_report_ms = now;
++      const unsigned int xruns = pcm_get_xruns(pcm);
++      if (xruns != last_xruns) {
++        fprintf(stderr, "AERA audio: xruns %u -> %u\n", last_xruns, xruns);
++        last_xruns = xruns;
++      }
++    }
++
++    /* Release the session only when nobody is feeding it any more, so a
++     * pipeline rebuild keeps the warm DSP stream. */
++    if (client < 0 && buffered == 0 && silent_ms >= kIdleCloseMs) {
++      ClosePcm(&pcm);
++    }
++  }
++
++  if (client >= 0) close(client);
++  ClosePcm(&pcm);
++  if (mixer != NULL) mixer_close(mixer);
++  if (dump_fd >= 0) close(dump_fd);
++  close(control);
++  close(server);
++  free(buffer);
++  free(period);
++  return 0;
++}

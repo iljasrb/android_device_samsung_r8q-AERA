@@ -1,0 +1,66 @@
+diff --git a/Android.bp b/Android.bp
+index 10268b0..24cc08f 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -20,6 +20,7 @@ cc_library {
+     host_supported: true,
+     vendor_available: true,
+     product_available: true,
++    recovery_available: true,
+     srcs: [
+         "mixer.c",
+         "mixer_hw.c",
+@@ -45,6 +46,7 @@ cc_library {
+ 
+ cc_binary {
+     name: "tinyplay",
++    recovery: true,
+     host_supported: true,
+     srcs: ["tinyplay.c"],
+     shared_libs: ["libtinyalsa"],
+@@ -58,6 +60,7 @@ cc_binary {
+ 
+ cc_binary {
+     name: "tinycap",
++    recovery: true,
+     srcs: ["tinycap.c"],
+     shared_libs: ["libtinyalsa"],
+     cflags: ["-Werror"],
+@@ -65,6 +68,7 @@ cc_binary {
+ 
+ cc_binary {
+     name: "tinymix",
++    recovery: true,
+     srcs: ["tinymix.c"],
+     shared_libs: ["libtinyalsa"],
+     cflags: ["-Werror", "-Wall"],
+@@ -72,6 +76,7 @@ cc_binary {
+ 
+ cc_binary {
+     name: "tinyhostless",
++    recovery: true,
+     srcs: ["tinyhostless.c"],
+     shared_libs: ["libtinyalsa"],
+     cflags: ["-Werror"],
+@@ -79,6 +84,7 @@ cc_binary {
+ 
+ cc_binary {
+     name: "tinypcminfo",
++    recovery: true,
+     srcs: ["tinypcminfo.c"],
+     shared_libs: ["libtinyalsa"],
+     cflags: ["-Werror"],
+diff --git a/tinyplay.c b/tinyplay.c
+index c5bb71f..099d6e5 100644
+--- a/tinyplay.c
++++ b/tinyplay.c
+@@ -266,7 +266,8 @@ void play_sample(FILE *file, unsigned int card, unsigned int device, unsigned in
+         num_read = fread(buffer, 1, read_sz, file);
+         if (num_read > 0) {
+             if (pcm_write(pcm, buffer, num_read)) {
+-                fprintf(stderr, "Error playing sample\n");
++                fprintf(stderr, "Error playing sample: %s\n",
++                        pcm_get_error(pcm));
+                 break;
+             }
+             data_sz -= num_read;

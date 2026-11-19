@@ -1,0 +1,28 @@
+--- a/aeraui/features/browser/jail_main.cpp
++++ b/aeraui/features/browser/jail_main.cpp
+@@ -447,6 +447,25 @@
+   // keeps audio/codec support independent of the per-app plugin payloads.
+   Check(minijail_bind(jail, "/system/etc/aera-gst-plugins",
+                       "/tmp/aera-gst-plugins", 0), "global GStreamer plugins");
++  // Some browser runtimes ship their own copy of this audio sink, and it is
++  // loaded from GST_PLUGIN_SYSTEM_PATH, so it would shadow the recovery-owned
++  // build. Bind ours over it when it is present, which keeps the downloaded
++  // payload untouched while making the recovery's sink the only one that loads.
++  //
++  // This is deliberately best-effort: the payload is downloaded and updated by
++  // the plugin store, so a future version may not contain the file at all, and
++  // the browser must still start. When it is absent, GST_PLUGIN_PATH alone
++  // provides the sink.
++  {
++    const std::string shipped =
++        root + "/usr/lib/gstreamer-1.0/libgstaeraaudio.so";
++    if (access(shipped.c_str(), F_OK) == 0) {
++      Check(minijail_bind(jail,
++                          "/system/etc/aera-gst-plugins/libgstaeraaudio.so",
++                          "/usr/lib/gstreamer-1.0/libgstaeraaudio.so", 0),
++            "global GStreamer audio sink");
++    }
++  }
+   // WebKit buffers media in /var/tmp (MediaPlayerPrivateGStreamer creates
+   // "/var/tmp/WebKit-Media-XXXXXX"). The extracted runtime has no /var at all,
+   // so progressive playback failed with "Could not create temp file" and an MSE

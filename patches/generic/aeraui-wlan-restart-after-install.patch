@@ -1,0 +1,63 @@
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -1255,10 +1255,22 @@
+   DataManager::SetValue(TW_UNMOUNT_SYSTEM, 0);
+ }
+ 
++// The installer stopped the WLAN stack to release /vendor. Re-run the same
++// enable+scan+saved-connect path as the WLAN page; only restarting the
++// supplicant left the radio down after the install.
++static void RestartWlanAfterInstall(bool was_up) {
++  if (!was_up) return;
++  WifiRequest request;
++  request.operation = WifiOperation::kEnable;
++  if (RecoveryRunWifi(request) != 0)
++    LOGERR("WLAN did not restart after install\n");
++}
++
+ int RecoveryRunSideload() {
+   if (!gSideloadActive.load(std::memory_order_acquire) &&
+       !RecoveryPrepareSideload()) return 1;
+ 
++  const bool wlan_was_up = Wlan::IsEnabled();
+   const bool mtp_was_enabled = TWFunc::Toggle_MTP(false);
+   TWFunc::SetPerformanceMode(true);
+   ReleaseVendorMountsForInstall();
+@@ -1273,6 +1285,7 @@
+   PartitionManager.Update_System_Details();
+   TWFunc::SetPerformanceMode(false);
+   RecoveryFinishSideload();
++  RestartWlanAfterInstall(wlan_was_up);
+   return result == 0 ? 0 : 1;
+ }
+ 
+@@ -1308,12 +1321,17 @@
+     gui_err("Finish or cancel background plugin storage tasks first.\n");
+     return 1;
+   }
++  const bool wlan_was_up = Wlan::IsEnabled();
+   if (request.job == Job::kInstall) ReleaseVendorMountsForInstall();
+   const char *method = request.job == Job::kInstall ? "ZIP installation" :
+       request.job == Job::kSideload ? "ADB sideload" :
+       request.job == Job::kFlashPayload ? "Advanced payload flash" :
+       request.job == Job::kFlashImage ? "Image flash" : nullptr;
+-  if (!method) return RecoveryRunJobImpl(request);
++  if (!method) {
++    const int result = RecoveryRunJobImpl(request);
++    RestartWlanAfterInstall(wlan_was_up);
++    return result;
++  }
+   std::string details = request.title;
+   if (!request.name.empty()) details += " / file name: " + request.name;
+   if (request.job == Job::kFlashImage) details += request.both_slots ? " / both slots" : " / current slot";
+@@ -1323,7 +1341,9 @@
+         " / manual protection override=" + (request.payload_override_protection ? "1" : "0");
+   for (const auto &partition : request.partitions) details += " / " + partition;
+   aera::flashlog::Recording recording(request.path, method, details);
+-  return recording.Finish(RecoveryRunJobImpl(request));
++  const int result = RecoveryRunJobImpl(request);
++  RestartWlanAfterInstall(wlan_was_up);
++  return recording.Finish(result);
+ }
+ static int RunImageZipJob(const JobRequest& request, const payload::Info& info) {
+   const bool flash = request.job == Job::kFlashPayload;

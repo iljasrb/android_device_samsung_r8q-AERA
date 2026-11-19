@@ -1,0 +1,21 @@
+//
+// Copyright (C) 2026 The Android Open Source Project
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+// Test/diagnostic tool: inject evdev touch and key events into the recovery UI
+// so the acceptance plan can drive the UI without a human tapping.
+cc_binary {
+    name: "aera-input",
+    srcs: ["aera-input.c"],
+    // Recovery only: PRODUCT_PACKAGES installs recovery: true modules into the
+    // recovery ramdisk, which is the only place the AERA UI runs.
+    recovery: true,
+    stl: "none",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+}

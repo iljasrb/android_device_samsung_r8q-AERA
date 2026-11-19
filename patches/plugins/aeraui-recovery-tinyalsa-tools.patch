@@ -1,0 +1,30 @@
+diff --git a/aeraui/Android.bp b/aeraui/Android.bp
+index f875084..5082411 100644
+--- a/aeraui/Android.bp
++++ b/aeraui/Android.bp
+@@ -25,7 +25,7 @@ cc_binary {
+     name: "aera-browser-jail",
+     recovery: true,
+     srcs: ["features/browser/jail_main.cpp"],
+-    required: ["aera-audio-null-bridge"],
++    required: ["aera-audio-null-bridge", "aera-audio-bridge", "tinyplay", "tinymix"],
+     static_executable: true,
+     stl: "libc++_static",
+     static_libs: ["libminijail", "libcap"],
+@@ -43,6 +43,16 @@ cc_binary {
+     cflags: ["-Wall", "-Wextra", "-Werror"],
+ }
+ 
++cc_binary {
++    name: "aera-audio-bridge",
++    recovery: true,
++    srcs: ["features/audio/pcm_bridge.c"],
++    stl: "none",
++    shared_libs: ["libtinyalsa"],
++    c_std: "gnu11",
++    cflags: ["-Wall", "-Wextra", "-Werror"],
++}
++
+ cc_binary {
+     name: "aera-artillery-audio",
+     recovery: true,

@@ -1,0 +1,27 @@
+--- a/aeraui/features/browser/jail_main.cpp
++++ b/aeraui/features/browser/jail_main.cpp
+@@ -455,6 +455,24 @@
+   Check(minijail_bind(jail, "/system/etc/aera-gst-plugins/libgstaeraaudio.so",
+                       "/usr/lib/gstreamer-1.0/libgstaeraaudio.so", 0),
+         "global GStreamer audio sink");
++  // WebKit buffers media in /var/tmp (MediaPlayerPrivateGStreamer creates
++  // "/var/tmp/WebKit-Media-XXXXXX"). The extracted runtime has no /var at all,
++  // so progressive playback failed with "Could not create temp file" and an MSE
++  // seek had nowhere to stage a segment.
++  //
++  // The jail root is a read-only bind, so minijail cannot create the mountpoint
++  // itself; it has to exist in the extracted runtime first. The extraction
++  // directory is a writable tmpfs owned by the recovery, so create it there.
++  for (const char *path : {"var", "var/tmp"}) {
++    const std::string directory = root + "/" + path;
++    if (mkdir(directory.c_str(), path == std::string("var") ? 0755 : 01777) != 0 &&
++        errno != EEXIST) {
++      Die("media temporary directory");
++    }
++  }
++  Check(minijail_mount_with_data(jail, "tmpfs", "/var/tmp", "tmpfs", flags,
++                                "size=256M,mode=1777,uid=99090,gid=99090"),
++        "private media temporary storage");
+   Check(minijail_mount_with_data(jail, "tmpfs", "/run", "tmpfs", flags,
+                                 "size=16M,mode=0755,uid=99090,gid=99090"), "private runtime storage");
+   Check(minijail_mount_with_data(jail, "tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC,

@@ -1,0 +1,17 @@
+--- a/aeraui/core/runner.cpp
++++ b/aeraui/core/runner.cpp
+@@ -539,6 +539,14 @@
+             if (already_active) {
+                 gModeTransitionBusy.store(false, std::memory_order_release);
+             } else {
++                if (hardware.screen_off) {
++                    // A CLI mode transition requested while the display is
++                    // suspended would otherwise leave its fade animation
++                    // unprocessed and keep gModeTransitionBusy set forever.
++                    aeraScreenTimer.Wake();
++                    engine.SetSuspended(false);
++                    hardware.screen_off = false;
++                }
+                 const uint32_t duration =
+                     toward_fastboot && RecoveryFastbootWifiStatus().enabled
+                         ? 1080 : 720;

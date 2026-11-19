@@ -1,0 +1,29 @@
+--- a/aeraui/features/browser/jail_main.cpp
++++ b/aeraui/features/browser/jail_main.cpp
+@@ -443,6 +443,10 @@
+                                 proc_options), "private proc view");
+   Check(minijail_mount_with_data(jail, "tmpfs", "/tmp", "tmpfs", flags,
+                                 "size=512M,mode=1777"), "private temporary storage");
++  // One recovery-owned GStreamer plugin set shared by every app jail. This
++  // keeps audio/codec support independent of the per-app plugin payloads.
++  Check(minijail_bind(jail, "/system/etc/aera-gst-plugins",
++                      "/tmp/aera-gst-plugins", 0), "global GStreamer plugins");
+   // The browser runtime that the plugin store ships also contains an old copy
+   // of our audio sink at this path. It is loaded from GST_PLUGIN_SYSTEM_PATH,
+   // shadows the recovery-owned build and cannot be disabled from the plugin
+@@ -591,9 +595,15 @@
+     // registry belongs in the private writable tmpfs; the runtime itself and
+     // recovery ramdisk remain read-only.
+     const_cast<char *>("GST_PLUGIN_SYSTEM_PATH=/usr/lib/gstreamer-1.0"),
++    const_cast<char *>("GST_PLUGIN_PATH=/tmp/aera-gst-plugins"),
++    const_cast<char *>("LD_LIBRARY_PATH=/tmp/aera-gst-plugins:/usr/lib:/lib"),
+     const_cast<char *>("GST_PLUGIN_SCANNER=/usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+     const_cast<char *>("GST_REGISTRY=/tmp/gstreamer-registry.bin"),
+     const_cast<char *>("GST_REGISTRY_REUSE_PLUGIN_SCANNER=no"),
++    // No GST_DEBUG / WEBKIT_DEBUG here on purpose: WebKit logs media messages
++    // synchronously, and leaving this at 3 made the video path run about a
++    // second behind (every frame hit "Dropping frame due to QoS"), which broke
++    // seeking long before any of it reached the audio bridge.
+     // The software Cairo tile painter defaults to half the detected cores.
+     // Dodge has six fast cores available in recovery; use all six so complex
+     // pages do not serialize repaint work behind touch input.

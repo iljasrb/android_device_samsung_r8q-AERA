@@ -1,0 +1,213 @@
+# Samsung Galaxy S20 FE 5G (r8q) recovery init.
+#
+# r8q ships a normal boot-header-v2 recovery image (kernel + gzip ramdisk +
+# recovery dtbo + dtb). The vendor is Android 13 / One UI with HIDL Keymaster
+# 4.0 and the QTI gatekeeper HAL, so recovery uses the standard TWRP QCOM FBE
+# chain from device/qcom/twrp-common:
+#
+#   TWRP vold -> qseecomd -> HIDL Keymaster 4.0 -> TEE
+#             -> QTI gatekeeper 1.0 -> TEE
+#
+# The binaries and their vendor-library closure are shipped in this ramdisk
+# (system/bin and vendor/lib64) because /vendor/bin does not exist until TWRP
+# mounts the real vendor partition. The qcom_decrypt/qcom_decrypt_fbe packages
+# provide /init.recovery.qcom_decrypt.rc and /init.recovery.qcom_decrypt.fbe.rc;
+# the imports below pull them in.
+
+import /init.recovery.qcom_decrypt.rc
+
+on init
+    # The qcom_decrypt package installs its own /system/bin/prepdecrypt.sh
+    # (mode 0644) before the device-tree overlay replaces its contents; cp
+    # keeps the old mode, so make the AERA wrapper executable again.
+    chmod 0755 /system/bin/prepdecrypt.sh /system/bin/aera-format-pending.sh
+
+    # The ROM's gralloc/mapper libraries are built against a newer libc++ and
+    # reference std::__1::__hash_memory, which the recovery libc++ lacks.
+    # hwservicemanager loads the QTI mapper in its own process and Adreno's
+    # platform subdriver loads libgralloccore during eglInitialize, so preload
+    # the shim globally. Only the shim: preloading libgralloc.qti.so here made
+    # the r8q vendor blobs fail to boot. The AeraGpu renderer clears this from
+    # its own environment after loading the shim, so installer/plugin `sh`
+    # children do not inherit it.
+    export LD_PRELOAD /system/lib64/libaera_gpu_compat.so
+
+on early-init
+    # Recovery's policy does not grant the recovery domain every TEE/SPU
+    # connection the vendor services need. The reference trees run recovery
+    # permissive for the same reason.
+    write /sys/fs/selinux/enforce 0
+
+    mkdir /mnt/vendor/persist
+    mkdir /mnt/vendor/efs
+    mkdir /mnt/vendor/spunvm
+
+on fs
+    wait /dev/block/platform/soc/${ro.boot.bootdevice}
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+
+    # Firmware and the secure world's non-volatile storage. The modem and
+    # apnhlos partitions are vfat; persist/efs are ext4.
+    mkdir /vendor/firmware_mnt
+    mount ext4 /dev/block/bootdevice/by-name/persist /mnt/vendor/persist rw
+    mount ext4 /dev/block/bootdevice/by-name/efs /mnt/vendor/efs rw
+    mount vfat /dev/block/bootdevice/by-name/apnhlos /vendor/firmware_mnt ro
+    # The modem firmware partition is not mounted: recovery does not run the
+    # modem stack, only the protection-domain services audio needs.
+
+    # The TEE/SPU nodes need the owners the vendor ueventd.rc gives them;
+    # recovery's ueventd does not apply that file before the services start.
+    chown system drmrpc /dev/qseecom
+    chmod 0660 /dev/qseecom
+    chown system drmrpc /dev/qsee_ipc_irq_spss
+    chmod 0660 /dev/qsee_ipc_irq_spss
+    chown system system /dev/spcom
+    chmod 0660 /dev/spcom
+    chown system system /dev/spss_utils
+    chmod 0660 /dev/spss_utils
+    chown system system /dev/ion
+    chmod 0664 /dev/ion
+
+on post-fs-data
+    mkdir /data/vendor/keymaster
+
+on property:crypto.ready=1
+    # Samsung's strongbox keymaster service and the SPU NVM daemons. The
+    # standard keymaster-4-0/gatekeeper-1-0 services are started by
+    # init.recovery.qcom_decrypt*.rc once qseecomd registers its listeners.
+    start keymaster-sb-4-0
+    start spdaemon
+    start sec_nvm
+
+on property:crypto.ready=0
+    stop keymaster-sb-4-0
+    stop spdaemon
+    stop sec_nvm
+
+on property:twrp.user.0.decrypt=0
+    umount /vendor/firmware-modem
+    umount /vendor/firmware_mnt
+    umount /mnt/vendor/efs
+    umount /mnt/vendor/persist
+
+# WLAN (QCA6390, built into the kernel). Reference: Skyward r8q.
+#
+# The host driver is resident and is asked to load by writing ON to /dev/wlan.
+# The chip's images are on the vendor partition, and the board data is sent by
+# cnss-daemon over QRTR. wlan-start.sh mounts /vendor, links the firmware,
+# starts qrtr-ns/cnss-daemon, sets fs_ready, then asks the driver to load.
+#
+# It is started from the AERA WLAN backend by sys.aera.wlan.up=1. At boot that
+# happens after the metadata key upgrade and decryption, because the daemons
+# keep their sockets on /data and bringing the driver up earlier makes the
+# upgrade fail. Starting it from the backend also keeps a WLAN failure from
+# taking the recovery down with it. The same trigger starts clock-sync, which
+# waits for DHCP before setting the current network time.
+
+# Hand /vendor back to TWRP/installers on request: setprop aera.release.mounts 1
+on property:aera.release.mounts=1
+    start release-mounts
+
+# The vendor partition is mounted at /tmp/wlan-vendor, not /vendor: the
+# recovery's own /vendor holds the AERA supplicant and the crypto/GPU
+# libraries, and the installers expect /vendor to be free.
+service qrtr-ns /tmp/wlan-vendor/bin/qrtr-ns -f
+    class core
+    user root
+    group root inet
+    setenv LD_LIBRARY_PATH /tmp/libkt:/tmp/wlan-vendor/lib64:/tmp/wlan-vendor/lib:/system/lib64:/system/lib:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+service cnss-daemon /tmp/wlan-vendor/bin/cnss-daemon -n -l
+    class core
+    user system
+    group system inet net_admin wifi
+    capabilities NET_ADMIN
+    setenv LD_LIBRARY_PATH /tmp/libkt:/tmp/wlan-vendor/lib64:/tmp/wlan-vendor/lib:/system/lib64:/system/lib:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+# The phone's own MAC loader. It writes the factory address to the driver and,
+# on kernels that expose it, asks the driver to load through boot_wlan.
+service macloader /tmp/wlan-vendor/bin/hw/macloader
+    class core
+    user wifi
+    group wifi inet net_raw net_admin
+    capabilities NET_ADMIN NET_RAW SYS_MODULE
+    setenv LD_LIBRARY_PATH /tmp/libkt:/tmp/wlan-vendor/lib64:/tmp/wlan-vendor/lib:/system/lib64:/system/lib:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+# AERA's WLAN backend expects an init service called wpa_supplicant with the
+# control socket in /tmp/recovery/sockets, and starts it on demand by setting
+# sys.aera.wlan.up=1. The settings are a writable copy made by wlan-start.sh.
+# The wrapper keeps the service running while the driver loads the firmware
+# and execs the real supplicant once wlan0 exists.
+service wpa_supplicant /system/bin/sh /system/bin/wpa-supplicant.sh
+    class core
+    user root
+    group root inet net_admin net_raw wifi
+    setenv LD_LIBRARY_PATH /tmp/libkt:/system/lib64:/vendor/lib64:/vendor/lib:/tmp/wlan-vendor/lib64:/tmp/wlan-vendor/lib:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+service wlan-bootstrap /system/bin/sh /system/bin/wlan-start.sh
+    class core
+    oneshot
+    user root
+    disabled
+    seclabel u:r:recovery:s0
+
+# Replace the build-epoch clock seed with the current network time once DHCP
+# has finished. Without it the recovery stays at the image timestamp and TLS
+# certificates look "not yet valid".
+service clock-sync /system/bin/sh /system/bin/clock-sync.sh
+    class core
+    oneshot
+    user root
+    disabled
+    seclabel u:r:recovery:s0
+
+service boot-adsp /system/bin/sh /system/bin/boot-adsp.sh
+    class core
+    oneshot
+    user root
+    disabled
+    seclabel u:r:recovery:s0
+
+# Qualcomm protection-domain services. pd-mapper maps the ADSP's avs/audio
+# PDR service and pm-service manages the ADSP power domain; without them the
+# audio notifier never creates q6core-audio and the ASoC card never registers.
+# These two are the only vendor/bin binaries recovery keeps; the modem helper
+# and pm-proxy services from the reference init.recovery.modem.rc are not
+# imported and are not shipped. wlan-start.sh starts pd-mapper/pm-service once
+# qrtr-ns is up.
+service pd-mapper /vendor/bin/pd-mapper
+    class core
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib:/system/lib64:/system/lib:/sbin
+    seclabel u:r:recovery:s0
+    disabled
+
+service pm-service /vendor/bin/pm-service
+    class core
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib:/system/lib64:/system/lib:/sbin
+    seclabel u:r:recovery:s0
+    ioprio rt 4
+    disabled
+
+service release-mounts /system/bin/sh /system/bin/release-mounts.sh
+    class core
+    oneshot
+    user root
+    disabled
+    seclabel u:r:recovery:s0
+
+on property:sys.aera.wlan.up=1
+    start wlan-bootstrap
+    start clock-sync
+    setprop sys.aera.wlan.up 0

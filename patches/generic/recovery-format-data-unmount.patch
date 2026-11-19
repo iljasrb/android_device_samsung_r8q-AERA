@@ -1,0 +1,51 @@
+diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
+index 7176b32f..1ac2fe06 100644
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -2006,8 +2045,45 @@ static int RecoveryRunJobImpl(const JobRequest &request) {
+       property_set("sys.usb.config", "none");
+       usleep(300000);
+     }
++    // The crypto consumers chdir into /data (gatekeeperd ->
++    // /data/misc/gatekeeper, keystore2 -> /data/misc/keystore) and keep it busy,
++    // so Format_Data cannot replace the filesystem ("Error: In use by the
++    // system!" from mkfs.f2fs). Stop them and detach /data first.
++    for (const char *service : {"gatekeeperd", "keystore2"}) {
++      if (android::base::GetProperty(std::string("init.svc.") + service, "") ==
++          "running") {
++        property_set("ctl.stop", service);
++      }
++    }
++    // dm-backed mounts (vendor, vendor_dlkm, metadata) stay attached: detaching
++    // them lazily does not help Format_Data, so the pending-format restart below
++    // is what makes the wipe succeed.
++    for (int attempt = 0; attempt < 25; ++attempt) {
++      if (!PartitionManager.Is_Mounted_By_Path("/data")) break;
++      PartitionManager.UnMount_By_Path("/data", true);
++      usleep(200000);
++    }
++    if (PartitionManager.Is_Mounted_By_Path("/data")) umount2("/data", MNT_DETACH);
++
++    // Metadata encryption keeps userdata mapped through dm-default-key, and the
++    // kernel holds that mapping open, so mkfs.f2fs cannot take the partition
++    // exclusively ("Error: In use by the system!") and the mapping cannot be
++    // removed. Format_Data() therefore only succeeds when the map is already
++    // gone; otherwise the format is marked pending and recovery restarts and
++    // formats userdata before the crypto chain maps it again.
++    TWFunc::Exec_Cmd("dmsetup remove userdata");
+     TWFunc::SetPerformanceMode(true);
+-    const int result = PartitionManager.Format_Data() ? 0 : 1;
++    int result = PartitionManager.Format_Data() ? 0 : 1;
++    if (result != 0) {
++      LOGINFO("AERA format: crypto mapping still held, deferring to restart\n");
++      if (TWFunc::Exec_Cmd("/system/bin/aera-format-pending.sh mark") == 0) {
++        result = 0;
++        TWFunc::SetPerformanceMode(false);
++        gui_msg(Msg("aera_format_restart=Formatting data, recovery will restart."));
++        property_set("sys.powerctl", "reboot,recovery");
++        return 0;
++      }
++    }
+     PartitionManager.Update_System_Details();
+     TWFunc::SetPerformanceMode(false);
+     if (restore_fastboot) property_set("sys.usb.config", "fastboot");

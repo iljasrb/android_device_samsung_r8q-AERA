@@ -1,0 +1,36 @@
+--- a/aeraui/features/browser/jail_main.cpp
++++ b/aeraui/features/browser/jail_main.cpp
+@@ -312,6 +312,14 @@
+   if (!removed_memory || !removed_tasks) fprintf(stderr, "Browser resource group cleanup incomplete\n");
+   _exit(!stopping && WIFEXITED(status) ? WEXITSTATUS(status) : 78);
+ }
++// Some recovery kernels are built without CONFIG_SECCOMP (the r8q vanadium
++// kernel lost it). The chroot, dedicated UID and empty capability set still
++// apply, so run without the syscall filter instead of refusing to start.
++static bool SeccompAvailable() {
++  errno = 0;
++  const long mode = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
++  return mode >= 0 || errno != EINVAL;
++}
+ int main(int argc, char **argv) {
+   const bool streams_engine_mode = argc >= 4 && argc <= 6 &&
+       !strcmp(argv[1], "--streams-engine");
+@@ -526,10 +534,14 @@
+   minijail_use_caps(jail, 0);
+   minijail_no_new_privs(jail);
+   const bool probe = !strcmp(argv[1], "--probe");
+-  auto policy = aera_jail::Policy();
+-  sock_fprog filter{static_cast<unsigned short>(policy.size()), policy.data()};
+-  minijail_set_seccomp_filters(jail, &filter);
+-  minijail_use_seccomp_filter(jail);
++  if (SeccompAvailable()) {
++    auto policy = aera_jail::Policy();
++    sock_fprog filter{static_cast<unsigned short>(policy.size()), policy.data()};
++    minijail_set_seccomp_filters(jail, &filter);
++    minijail_use_seccomp_filter(jail);
++  } else {
++    fprintf(stderr, "browser: seccomp unavailable; running without syscall filter\n");
++  }
+   // Any failed mount, privilege drop or filter load terminates the helper.
+   minijail_enter(jail);
+   Check(prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), "non-dumpable process");

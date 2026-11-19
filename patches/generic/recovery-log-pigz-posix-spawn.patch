@@ -1,0 +1,54 @@
+--- a/twrp-functions.cpp
++++ b/twrp-functions.cpp
+@@ -974,7 +974,7 @@
+ 
+ void TWFunc::Copy_Log(string Source, string Destination) {
+ 	int logPipe[2];
+-	int pigz_pid;
++	int pigz_pid = -1;
+ 	int destination_fd;
+ 	std::string destLogBuffer;
+ 
+@@ -1017,21 +1017,30 @@
+ 
+ 	destination_fd = open(Destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+ 
+-	pigz_pid = fork();
+-	if (pigz_pid < 0) {
+-		LOGINFO("fork() failed\n");
++	posix_spawn_file_actions_t actions;
++	posix_spawn_file_actions_init(&actions);
++	posix_spawn_file_actions_adddup2(&actions, logPipe[0], STDIN_FILENO);
++	posix_spawn_file_actions_adddup2(&actions, destination_fd, STDOUT_FILENO);
++	posix_spawn_file_actions_addclose(&actions, logPipe[1]);
++	posix_spawnattr_t attr;
++	posix_spawnattr_init(&attr);
++	// File actions make bionic fall back to fork() by default, which can
++	// deadlock before exec while the UI threads run. Force the vfork path.
++	posix_spawnattr_setflags(&attr, POSIX_SPAWN_USEVFORK);
++	char *pigz_argv[] = {
++		const_cast<char*>("pigz"),
++		const_cast<char*>("-"),
++		nullptr,
++	};
++	int spawn_error = posix_spawnp(&pigz_pid, "pigz", &actions, &attr,
++	                               pigz_argv, environ);
++	posix_spawnattr_destroy(&attr);
++	posix_spawn_file_actions_destroy(&actions);
++	if (spawn_error != 0) {
++		LOGINFO("posix_spawnp(pigz) failed: %d\n", spawn_error);
+ 		close(destination_fd);
+ 		close(logPipe[0]);
+ 		close(logPipe[1]);
+-	} else if (pigz_pid == 0) {
+-		close(logPipe[1]);
+-		dup2(logPipe[0], fileno(stdin));
+-		dup2(destination_fd, fileno(stdout));
+-		if (execlp("pigz", "pigz", "-", NULL) < 0) {
+-			close(destination_fd);
+-			close(logPipe[0]);
+-			_exit(-1);
+-		}
+ 	} else {
+ 		close(logPipe[0]);
+ 		if (write(logPipe[1], destLogBuffer.c_str(), destLogBuffer.size()) < 0) {

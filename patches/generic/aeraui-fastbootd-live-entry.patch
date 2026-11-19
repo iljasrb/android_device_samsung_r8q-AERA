@@ -1,0 +1,44 @@
+diff --git a/aeraui/core/runner.cpp b/aeraui/core/runner.cpp
+index 04582358..66eb00e0 100644
+--- a/aeraui/core/runner.cpp
++++ b/aeraui/core/runner.cpp
+@@ -583,7 +597,17 @@ RunResult RunLoop(bool fastboot_mode = false,
+                     __android_log_print(ANDROID_LOG_INFO, kLogTag,
+                                         "live fastbootd mode active");
+                 } else {
+-                    engine.SetFastbootMode(false);
++                    // The live hand-off cannot unmount /vendor once recovery
++                    // itself has mapped vendor libraries, so on those boots the
++                    // only reliable entry is the BCB path used by Lineage
++                    // recovery. Ask init directly: it writes boot-fastboot and
++                    // reboots, and does not need this LVGL/EGL context to be
++                    // torn down (which aborted after a failed hand-off).
++                    gModeTransitionBusy.store(false, std::memory_order_release);
++                    __android_log_print(ANDROID_LOG_WARN, kLogTag,
++                                        "live fastbootd failed; rebooting to cold fastbootd");
++                    android::base::SetProperty("sys.powerctl", "reboot,fastboot");
++                    while (true) sleep(1);
+                 }
+                 gModeTransitionBusy.store(false, std::memory_order_release);
+                 continue;
+diff --git a/twrp.cpp b/twrp.cpp
+index f865e134..102226c8 100644
+--- a/twrp.cpp
++++ b/twrp.cpp
+@@ -148,14 +148,14 @@ static void process_fastbootd_mode() {
+ #endif
+ 
+ 		gui_msg(Msg("fastboot_console_msg=Entered Fastboot mode..."));
+-		property_set("ro.aera.fastbootd", "1");
++		android::base::SetProperty(TW_FASTBOOT_MODE_PROP, "1");
+ 		property_set("ro.boot.verifiedbootstate", "orange");
+ 		TWFunc::RunFoxScript("/system/bin/runatboot.sh", "");
+ 		TWFunc::RunFoxScript("/system/bin/postfastboot.sh", "");
+ 		if (gui_startPage("fastboot", 1, 1) != 0) {
+ 			LOGERR("Failed to start fastbootd page.\n");
+ 		}
+-		property_set("ro.aera.fastbootd", "0");
++		android::base::SetProperty(TW_FASTBOOT_MODE_PROP, "0");
+ }
+ 
+ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo,

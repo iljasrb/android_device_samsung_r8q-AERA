@@ -1,0 +1,60 @@
+--- a/twrp-functions.cpp
++++ b/twrp-functions.cpp
+@@ -38,6 +38,9 @@
+ #include <sys/vfs.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
++#include <spawn.h>
++
++extern char **environ;
+ #include <iostream>
+ #include <fstream>
+ #include <sstream>
+@@ -454,29 +457,28 @@
+ }
+ 
+ int TWFunc::Exec_Cmd(const string& cmd, bool Show_Errors) {
+-	pid_t pid;
+-	int status;
+ 	string tmp = "/sbin/sh";
+ 	if (!Path_Exists(tmp))
+ 	   tmp = "/system/bin/sh";
+-	
+-	switch(pid = fork())
+-	{
+-		case -1:
+-			LOGERR("Exec_Cmd(): vfork failed: %d!\n", errno);
+-			return -1;
+-		case 0: // child
+-			execl(tmp.c_str(), "sh", "-c", cmd.c_str(), NULL);
+-			_exit(127);
+-			break;
+-		default:
+-		{
+-			if (TWFunc::Wait_For_Child(pid, &status, cmd, Show_Errors) != 0)
+-				return -1;
+-			else
+-				return 0;
+-		}
++	char *argv[] = {
++		const_cast<char*>("sh"),
++		const_cast<char*>("-c"),
++		const_cast<char*>(cmd.c_str()),
++		nullptr,
++	};
++	pid_t pid = -1;
++	// posix_spawn is safe while the native UI and battery threads are running.
++	// A hand-rolled fork()+execl() can deadlock in the child before exec when
++	// another thread holds a libc/malloc lock, leaving the parent waiting forever.
++	int spawn_error = posix_spawn(&pid, tmp.c_str(), nullptr, nullptr, argv, environ);
++	if (spawn_error != 0) {
++		LOGERR("Exec_Cmd(): posix_spawn failed: %d\n", spawn_error);
++		return -1;
+ 	}
++	int status;
++	if (TWFunc::Wait_For_Child(pid, &status, cmd, Show_Errors) != 0)
++		return -1;
++	return 0;
+ }
+ 
+ int TWFunc::Exec_Cmd(const string& cmd, string &result, bool combine_stderr) {

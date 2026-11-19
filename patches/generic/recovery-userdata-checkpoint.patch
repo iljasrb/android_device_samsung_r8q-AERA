@@ -1,0 +1,76 @@
+diff --git a/aeraui/core/runner.cpp b/aeraui/core/runner.cpp
+index 04582358..66eb00e0 100644
+--- a/aeraui/core/runner.cpp
++++ b/aeraui/core/runner.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "aeraui/runner.hpp"
++#include "twrp-functions.hpp"
+ #include "../../aera_shared_storage.hpp"
+ #include "operation_affinity.hpp"
+ 
+@@ -16,6 +17,7 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <atomic>
+ #include <condition_variable>
+ #include <cstdlib>
+@@ -23,6 +25,7 @@
+ #include <string>
+ #include <thread>
+ 
++#include <android-base/properties.h>
+ #include <android/log.h>
+ #include <minuitwrp/minui.h>
+ 
+@@ -740,6 +764,21 @@ DecryptionResult RunAeraUiDecryption(int credential_type,
+ }
+ 
+ RunResult RunAeraUi(const DisplayMetrics& metrics) {
++    // One-shot, off the UI thread: a checkpoint-disabled userdata rolls back to
++    // an old checkpoint, losing recovery's own writes (settings, backups).
++    // Waits for the storage mount, then remounts with checkpoints enabled.
++    std::thread([] {
++        for (int attempt = 0; attempt < 40; ++attempt) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(500));
++            std::string mounts;
++            if (TWFunc::read_file("/proc/mounts", mounts) != 0) continue;
++            if (mounts.find(" /data f2fs ") == std::string::npos) continue;
++            if (mounts.find("checkpoint=disable") == std::string::npos) break;
++            TWFunc::Exec_Cmd("mount -o remount,checkpoint=enable /data");
++            break;
++        }
++    }).detach();
++
+     std::thread early_thread;
+     bool run_inline = false;
+     {
+diff --git a/partition.cpp b/partition.cpp
+index 332ead03..f4d805b0 100644
+--- a/partition.cpp
++++ b/partition.cpp
+@@ -1798,6 +1798,21 @@ bool TWPartition::Mount(bool Display_Error) {
+ 	}
+ 
+ exit:
++	// make_f2fs leaves userdata checkpoint-disabled; while that flag is set the
++	// kernel rolls back to an old checkpoint, so recovery shows stale content and
++	// loses its own writes on the next boot. Mount() is polled, and a remount is
++	// a full f2fs mount, so try once per process and only while it is disabled.
++	if (Mount_Point == "/data" && Current_File_System == "f2fs") {
++		static bool checkpoint_checked = false;
++		if (!checkpoint_checked) {
++			std::string mounts;
++			if (TWFunc::read_file("/proc/mounts", mounts) == 0) {
++				checkpoint_checked = true;
++				if (mounts.find("checkpoint=disable") != std::string::npos)
++					TWFunc::Exec_Cmd("mount -o remount,checkpoint=enable /data");
++			}
++		}
++	}
+ 	if (Removable)
+ 		Update_Size(Display_Error);
+ 

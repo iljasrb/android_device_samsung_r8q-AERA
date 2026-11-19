@@ -1,0 +1,46 @@
+--- a/aera_rpc/aera_engine.cpp
++++ b/aera_rpc/aera_engine.cpp
+@@ -47,6 +47,16 @@
+   return result;
+ }
+ 
++// The CLI accepts partition names ("boot") as well as volume paths ("/boot").
++// Normalize to the paths RecoveryRunJobImpl compares against, so a bare name
++// works instead of producing the unhelpful "could not create" error.
++std::vector<std::string> PartitionPaths(const Json::Value &args) {
++  std::vector<std::string> result = Strings(args, "parts");
++  for (auto &path : result)
++    if (path[0] != '/') path.insert(path.begin(), '/');
++  return result;
++}
++
+ Json::Value Volumes(const std::vector<Volume> &volumes, bool mounted_state) {
+   Json::Value result(Json::objectValue);
+   Json::Value items(Json::arrayValue);
+@@ -124,7 +134,7 @@
+ }
+ 
+ int Backup(const Request &request, EventSink &events) {
+-  const auto partitions = Strings(request.arguments, "parts");
++  const auto partitions = PartitionPaths(request.arguments);
+   if (partitions.empty()) return Fail(events, "missing_partitions", "Backup requires at least one partition", 2);
+   JobRequest job;
+   job.job = Job::kBackup;
+@@ -145,7 +155,7 @@
+     if (!name.empty()) folder = aeraui::RecoveryBackupRoot() + "/" + name;
+   }
+   if (folder.empty()) return Fail(events, "missing_backup", "Restore requires a backup name or path", 2);
+-  auto partitions = Strings(request.arguments, "parts");
++  auto partitions = PartitionPaths(request.arguments);
+   if (partitions.empty()) {
+     for (const auto &volume : aeraui::RecoveryRestoreVolumes(folder))
+       if (volume.path != "ADB Backup") partitions.push_back(volume.path);
+@@ -161,7 +171,7 @@
+ }
+ 
+ int Wipe(const Request &request, EventSink &events) {
+-  const auto partitions = Strings(request.arguments, "parts");
++  const auto partitions = PartitionPaths(request.arguments);
+   if (partitions.empty()) {
+     events.Data("wipe_targets", Volumes(aeraui::RecoveryVolumes("wipe"), false));
+     return 0;
