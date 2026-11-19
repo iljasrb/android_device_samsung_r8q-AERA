@@ -1,0 +1,26 @@
+# Local research and development notes stay out of the repo
+docs/
+
+# Build outputs, rollback images and checksum sidecars
+out/
+backup/
+*.img
+!prebuilt/dtbo.img
+*.zip
+*.log
+*.md5
+*.sha256
+
+# Publishing target: host and path are local, this repo is public
+.env.publish
+
+# Local helper scripts and test captures
+scripts/dev/
+logs/
+
+# Python bytecode from helper scripts
+__pycache__/
+*.pyc
+
+# Private bring-up notes and acceptance evidence
+machine-docs/

@@ -1,0 +1,22 @@
+# Crypto. These are the properties the installed Samsung/Qualcomm vendor image
+# uses for metadata (FBE-DE) encryption; recovery's prop.default must carry the
+# same values before TWRP's first Decrypt_Data().
+ro.crypto.allow_encrypt_override=true
+ro.crypto.metadata_init_delete_all_keys.enabled=false
+ro.crypto.dm_default_key.options_format.version=2
+ro.crypto.volume.metadata.method=dm-default-key
+ro.security.keystore.keytype=sakv2,gak,sgak
+ro.hardware.keystore=mdfpp
+ro.hardware.gatekeeper=mdfpp
+ro.hardware.keystore.desede=true
+ro.crypto.volume.options=::v2
+
+# USB
+vendor.usb.use_ffs_mtp=1
+
+# Adreno 650
+ro.hardware.egl=adreno
+ro.opengles.version=196610
+
+# FUSE passthrough
+persist.sys.fuse.passthrough.enable=true
