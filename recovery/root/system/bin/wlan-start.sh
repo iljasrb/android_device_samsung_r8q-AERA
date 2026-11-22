@@ -166,16 +166,34 @@ log "libkt ready"
 [ -e /dev/ipa ] && echo 1 > /dev/ipa 2>>"$LOG"
 log "ipa ready"
 
-# 7. The folders cnss-daemon and the supplicant keep their sockets in.
-for d in /data/vendor/wifi /data/vendor/wifi/sockets \
-         /data/vendor/wifi/wpa /data/vendor/wifi/wpa/sockets \
-         /data/vendor/conn; do
-    mkdir -p "$d"
-done
-chown -R system:system /data/vendor/wifi /data/vendor/conn
-chmod 0771 /data/vendor/wifi /data/vendor/conn
-chmod 0770 /data/vendor/wifi/sockets /data/vendor/wifi/wpa
+# 7. cnss-daemon needs its socket directory before it can bind
+#    cnss_user_server, but it must never touch real /data: files created here
+#    carry recovery's SELinux label, and Android's cnss-daemon is then denied
+#    unlinking the stale socket ("Address already in use"), which leaves Wi-Fi
+#    dead until /data is wiped. Put a tmpfs over the directory so the sockets
+#    vanish with this boot.
+#    Heal entries left behind by older builds: Android recreates both
+#    directories with the right label and ownership on its next boot. Runs
+#    before the tmpfs, which would otherwise hide them.
+if ! grep -q ' /data ' /proc/mounts; then
+    log "data is not mounted"
+    exit 1
+fi
+rm -rf /data/vendor/wifi/sockets /data/vendor/wifi/wpa 2>/dev/null
+mkdir -p /data/vendor/wifi
+grep -q ' /data/vendor/wifi tmpfs ' /proc/mounts ||
+    mount -t tmpfs tmpfs /data/vendor/wifi 2>>"$LOG"
+if ! grep -q ' /data/vendor/wifi tmpfs ' /proc/mounts; then
+    log "cannot mount tmpfs over /data/vendor/wifi"
+    exit 1
+fi
+mkdir -p /data/vendor/wifi/sockets /data/vendor/wifi/wpa/sockets
+chown -R system:system /data/vendor/wifi
+chmod 0770 /data/vendor/wifi/sockets
 chmod 0777 /data/vendor/wifi/wpa/sockets
+# Leave /data/vendor/conn alone: it belongs to Android's Wi-Fi stack and
+# recovery has no writer for it. Recursively chowning it to system can break
+# the wifi uid's access.
 log "wifi dirs ready"
 
 # The MAC node belongs to wifi, as the phone's own init gives it.
