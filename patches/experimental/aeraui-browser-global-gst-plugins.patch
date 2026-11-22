@@ -1,6 +1,8 @@
+diff --git a/aeraui/features/browser/jail_main.cpp b/aeraui/features/browser/jail_main.cpp
+index f3fbfe9..594df5d 100644
 --- a/aeraui/features/browser/jail_main.cpp
 +++ b/aeraui/features/browser/jail_main.cpp
-@@ -443,6 +443,10 @@
+@@ -424,6 +424,10 @@ int main(int argc, char **argv) {
                                  proc_options), "private proc view");
    Check(minijail_mount_with_data(jail, "tmpfs", "/tmp", "tmpfs", flags,
                                  "size=512M,mode=1777"), "private temporary storage");
@@ -8,10 +10,10 @@
 +  // keeps audio/codec support independent of the per-app plugin payloads.
 +  Check(minijail_bind(jail, "/system/etc/aera-gst-plugins",
 +                      "/tmp/aera-gst-plugins", 0), "global GStreamer plugins");
-   // The browser runtime that the plugin store ships also contains an old copy
-   // of our audio sink at this path. It is loaded from GST_PLUGIN_SYSTEM_PATH,
-   // shadows the recovery-owned build and cannot be disabled from the plugin
-@@ -591,9 +595,15 @@
+   Check(minijail_mount_with_data(jail, "tmpfs", "/run", "tmpfs", flags,
+                                 "size=16M,mode=0755,uid=99090,gid=99090"), "private runtime storage");
+   Check(minijail_mount_with_data(jail, "tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC,
+@@ -560,9 +564,15 @@ int main(int argc, char **argv) {
      // registry belongs in the private writable tmpfs; the runtime itself and
      // recovery ramdisk remain read-only.
      const_cast<char *>("GST_PLUGIN_SYSTEM_PATH=/usr/lib/gstreamer-1.0"),

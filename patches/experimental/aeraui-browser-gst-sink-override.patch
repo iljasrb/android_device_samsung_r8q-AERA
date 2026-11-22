@@ -1,6 +1,8 @@
+diff --git a/aeraui/features/browser/jail_main.cpp b/aeraui/features/browser/jail_main.cpp
+index 594df5d..bfc7797 100644
 --- a/aeraui/features/browser/jail_main.cpp
 +++ b/aeraui/features/browser/jail_main.cpp
-@@ -447,6 +447,25 @@
+@@ -428,6 +428,25 @@ int main(int argc, char **argv) {
    // keeps audio/codec support independent of the per-app plugin payloads.
    Check(minijail_bind(jail, "/system/etc/aera-gst-plugins",
                        "/tmp/aera-gst-plugins", 0), "global GStreamer plugins");
@@ -23,6 +25,6 @@
 +            "global GStreamer audio sink");
 +    }
 +  }
-   // WebKit buffers media in /var/tmp (MediaPlayerPrivateGStreamer creates
-   // "/var/tmp/WebKit-Media-XXXXXX"). The extracted runtime has no /var at all,
-   // so progressive playback failed with "Could not create temp file" and an MSE
+   Check(minijail_mount_with_data(jail, "tmpfs", "/run", "tmpfs", flags,
+                                 "size=16M,mode=0755,uid=99090,gid=99090"), "private runtime storage");
+   Check(minijail_mount_with_data(jail, "tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC,

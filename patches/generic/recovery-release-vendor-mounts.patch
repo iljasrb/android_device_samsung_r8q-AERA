@@ -1,8 +1,8 @@
 diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
-index 97f6f14..755f868 100644
+index df55229..8253ac7 100644
 --- a/aeraui/platform/aera_backend.cpp
 +++ b/aeraui/platform/aera_backend.cpp
-@@ -720,6 +720,10 @@ bool RecoveryDataLocked() {
+@@ -722,6 +722,10 @@ bool RecoveryDataLocked() {
           DataManager::GetIntValue(TW_IS_DECRYPTED) == 0;
  }
  
@@ -13,7 +13,7 @@ index 97f6f14..755f868 100644
  bool RecoveryEnterFastbootd() {
    RecoveryShutdownScreenFingerprint();
    aera::mobile::StorageLease mobile_lease;
-@@ -740,6 +744,12 @@ bool RecoveryEnterFastbootd() {
+@@ -742,6 +746,12 @@ bool RecoveryEnterFastbootd() {
    TWFunc::Toggle_MTP(false);
    property_set("sys.usb.config", "none");
    usleep(200000);
@@ -26,7 +26,7 @@ index 97f6f14..755f868 100644
    if (!PartitionManager.Unmap_Super_Devices(true)) {
      LOGERR("AERA live fastbootd: could not release dynamic partitions.\n");
      PartitionManager.Setup_Super_Devices();
-@@ -1218,12 +1228,37 @@ bool RecoveryCancelSideload() {
+@@ -1220,6 +1230,30 @@ bool RecoveryCancelSideload() {
    return CancelAdbSideload();
  }
  
@@ -54,20 +54,21 @@ index 97f6f14..755f868 100644
 +  DataManager::SetValue(TW_UNMOUNT_SYSTEM, 0);
 +}
 +
- int RecoveryRunSideload() {
-   if (!gSideloadActive.load(std::memory_order_acquire) &&
-       !RecoveryPrepareSideload()) return 1;
- 
+ static void RestartWlanAfterInstall(bool was_up) {
+   if (!was_up) return;
+   WifiRequest request;
+@@ -1235,6 +1269,7 @@ int RecoveryRunSideload() {
+   const bool wlan_was_up = Wlan::IsEnabled();
    const bool mtp_was_enabled = TWFunc::Toggle_MTP(false);
    TWFunc::SetPerformanceMode(true);
 +  ReleaseVendorMountsForInstall();
    Device::BuiltinAction reboot_action = Device::REBOOT_BOOTLOADER;
    const int result = twrp_sideload(
        "/", &reboot_action, [](uint64_t received, uint64_t total) {
-@@ -1270,6 +1305,7 @@ int RecoveryRunJob(const JobRequest &request) {
-     gui_err("Finish or cancel background plugin storage tasks first.\n");
+@@ -1285,6 +1320,7 @@ int RecoveryRunJob(const JobRequest &request) {
      return 1;
    }
+   const bool wlan_was_up = Wlan::IsEnabled();
 +  if (request.job == Job::kInstall) ReleaseVendorMountsForInstall();
    const char *method = request.job == Job::kInstall ? "ZIP installation" :
        request.job == Job::kSideload ? "ADB sideload" :
