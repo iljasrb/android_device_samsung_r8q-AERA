@@ -7,9 +7,9 @@
 #
 #   scripts/publish.sh --yes --keep  # ... and keep the replaced build in archive/
 #
-# Publishes the newest AERA-*-r8q.img and .zip plus catalog.json, the feed the
-# in-recovery updater reads (schema 1). It looks in $AERA_OUT, then the device
-# tree's out/, then $AERA_DIR/out/target/product/r8q.
+# Publishes the newest AERA-*-r8q.img, .img.tar and .zip plus catalog.json, the
+# feed the in-recovery updater reads (schema 1). It looks in $AERA_OUT, then the
+# device tree's out/, then $AERA_DIR/out/target/product/r8q.
 #
 # Files are uploaded into a staging directory and swapped into latest/ only after
 # every one landed at the expected size, so an interrupted upload leaves the
@@ -70,6 +70,9 @@ zip=$(ls -t "$out"/AERA-*-r8q.zip 2>/dev/null | head -1)
 [ -n "$zip" ] || { echo "no AERA-*-r8q.zip in $out (the updater installs the zip)" >&2; exit 1; }
 img_name=$(basename "$img")
 zip_name=$(basename "$zip")
+tar="$img.tar"
+[ -f "$tar" ] || { echo "no ${img_name}.tar in $out" >&2; exit 1; }
+tar_name=$(basename "$tar")
 build=${img_name#AERA-}; build=${build%-r8q.img}
 
 # The updater installs the referenced package as a zip and compares build_time
@@ -82,8 +85,8 @@ version=$(sed -n 's/^AERA_INTERNAL_RELEASE="\(.*\)"/\1/p' <<<"$vars")
 [ -n "$build_time" ] || { echo "no ro.build.date.utc_aera in $zip_name" >&2; exit 1; }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-( cd "$out" && md5sum "$img_name" "$zip_name" >"$tmp/MD5SUMS" )
-( cd "$out" && sha256sum "$img_name" "$zip_name" >"$tmp/SHA256SUMS" )
+( cd "$out" && md5sum "$img_name" "$tar_name" "$zip_name" >"$tmp/MD5SUMS" )
+( cd "$out" && sha256sum "$img_name" "$tar_name" "$zip_name" >"$tmp/SHA256SUMS" )
 sha_zip=$(awk -v f="$zip_name" '$2 == f { print $1 }' "$tmp/SHA256SUMS")
 
 catalog=catalog.json
@@ -105,29 +108,29 @@ json.dump(doc, open(dst, 'w'), indent=2)
 open(dst, 'a').write("\n")
 PY
 
-python3 - "$tmp/latest.json" "$baseurl" "$build" "$img" "$zip" <<'PY'
+python3 - "$tmp/latest.json" "$baseurl" "$build" "$img" "$tar" "$zip" <<'PY'
 import datetime, hashlib, json, os, sys
-dst, base, build, img, zpath = sys.argv[1:6]
+dst, base, build, img, tpath, zpath = sys.argv[1:7]
 def entry(path):
     return {"url": f"{base}/latest/{os.path.basename(path)}",
             "size": os.path.getsize(path),
             "sha256": hashlib.sha256(open(path, 'rb').read()).hexdigest()}
 doc = {"build": build, "published": datetime.date.today().isoformat(),
-       "image": entry(img), "installer": entry(zpath)}
+       "image": entry(img), "odin": entry(tpath), "installer": entry(zpath)}
 json.dump(doc, open(dst, 'w'), indent=2)
 open(dst, 'a').write("\n")
 PY
 
-echo "publishing $img_name + $zip_name as $build ($build_type $version, $build_time)"
+echo "publishing $img_name + $tar_name + $zip_name as $build ($build_type $version, $build_time)"
 [ "$dry" = 1 ] && echo "  target $host:$site"
 run rsh "mkdir -p $stage"
 
 rsync_opts=(-ah --partial)
 [ -t 1 ] && rsync_opts+=(--info=progress2)
-run rsync "${rsync_opts[@]}" "$img" "$zip" \
+run rsync "${rsync_opts[@]}" "$img" "$tar" "$zip" \
     "$tmp/MD5SUMS" "$tmp/SHA256SUMS" "$tmp/latest.json" "$tmp/$catalog" "$host:$stage/"
 
-for f in "$img_name" "$zip_name"; do
+for f in "$img_name" "$tar_name" "$zip_name"; do
     local_size=$(stat -c %s "$out/$f")
     if [ "$dry" = 1 ]; then
         printf '  would: check %s is %s bytes on the server\n' "$f" "$local_size"
@@ -154,9 +157,11 @@ if [ "$dry" = 1 ]; then
     exit 0
 fi
 
-want=$(stat -c %s "$out/$zip_name"); url=$baseurl/latest/$zip_name
-got=$(curl -sIL "$url" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')
-[ "$got" = "$want" ] || { echo "verify FAILED: $url serves $got bytes, want $want" >&2; exit 1; }
-echo "verified: $url ($got bytes)"
+for name in "$zip_name" "$tar_name"; do
+    want=$(stat -c %s "$out/$name"); url=$baseurl/latest/$name
+    got=$(curl -sIL "$url" | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')
+    [ "$got" = "$want" ] || { echo "verify FAILED: $url serves $got bytes, want $want" >&2; exit 1; }
+    echo "verified: $url ($got bytes)"
+done
 curl -sf "$baseurl/$catalog" >/dev/null || { echo "catalog not served: $baseurl/$catalog" >&2; exit 1; }
 echo "verified: $baseurl/$catalog"
