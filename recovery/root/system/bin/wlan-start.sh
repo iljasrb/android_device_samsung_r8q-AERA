@@ -172,14 +172,17 @@ log "ipa ready"
 #    unlinking the stale socket ("Address already in use"), which leaves Wi-Fi
 #    dead until /data is wiped. Put a tmpfs over the directory so the sockets
 #    vanish with this boot.
-#    Heal entries left behind by older builds: Android recreates both
-#    directories with the right label and ownership on its next boot. Runs
-#    before the tmpfs, which would otherwise hide them.
+#    Heal entries left behind by older builds: Android recreates these
+#    runtime directories with the right label and ownership on its next boot.
+#    hostapd's config was also caught by the old recursive chown, so remove it
+#    too and let hostapd write a fresh one. Runs before the tmpfs, which would
+#    otherwise hide the real entries.
 if ! grep -q ' /data ' /proc/mounts; then
     log "data is not mounted"
     exit 1
 fi
-rm -rf /data/vendor/wifi/sockets /data/vendor/wifi/wpa 2>/dev/null
+rm -rf /data/vendor/wifi/sockets /data/vendor/wifi/wpa \
+       /data/vendor/wifi/hostapd 2>/dev/null
 mkdir -p /data/vendor/wifi
 grep -q ' /data/vendor/wifi tmpfs ' /proc/mounts ||
     mount -t tmpfs tmpfs /data/vendor/wifi 2>>"$LOG"
